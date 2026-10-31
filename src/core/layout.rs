@@ -46,20 +46,22 @@ pub fn canvas_size(scale: f32) -> CanvasSize {
     }
 }
 
-/// Computes the notch geometry for a given animation progress (0.0 = closed, 1.0 = open)
+/// Computes the notch geometry for independent width and height animation progress
 /// and DPI scale factor.
 ///
-/// Top edge is always flat ($y = 0.0$), and the shape is centered horizontally within the canvas.
-/// Overshoot (progress > 1.0) is clamped to the maximum canvas bounds.
+/// Corner radius is determined exclusively by height progress clamped to [0.0, 1.0].
 #[must_use]
-pub fn calculate_geometry(progress: f32, scale: f32) -> NotchGeometry {
+pub fn calculate_geometry_per_axis(progress_w: f32, progress_h: f32, scale: f32) -> NotchGeometry {
     let canvas = canvas_size(scale);
     let max_w = canvas.width as f32;
     let max_h = canvas.height as f32;
 
-    let log_w = CLOSED_WIDTH_LOGICAL + (OPEN_WIDTH_LOGICAL - CLOSED_WIDTH_LOGICAL) * progress;
-    let log_h = CLOSED_HEIGHT_LOGICAL + (OPEN_HEIGHT_LOGICAL - CLOSED_HEIGHT_LOGICAL) * progress;
-    let log_r = CLOSED_RADIUS_LOGICAL + (OPEN_RADIUS_LOGICAL - CLOSED_RADIUS_LOGICAL) * progress;
+    let log_w = CLOSED_WIDTH_LOGICAL + (OPEN_WIDTH_LOGICAL - CLOSED_WIDTH_LOGICAL) * progress_w;
+    let log_h = CLOSED_HEIGHT_LOGICAL + (OPEN_HEIGHT_LOGICAL - CLOSED_HEIGHT_LOGICAL) * progress_h;
+
+    // Corner radius strictly follows height progress clamped to [0.0, 1.0]
+    let p_h = progress_h.clamp(0.0, 1.0);
+    let log_r = CLOSED_RADIUS_LOGICAL + (OPEN_RADIUS_LOGICAL - CLOSED_RADIUS_LOGICAL) * p_h;
 
     let phys_w = (log_w * scale).clamp(CLOSED_WIDTH_LOGICAL * scale * 0.5, max_w);
     let phys_h = (log_h * scale).clamp(CLOSED_HEIGHT_LOGICAL * scale * 0.5, max_h);
@@ -77,6 +79,17 @@ pub fn calculate_geometry(progress: f32, scale: f32) -> NotchGeometry {
         x,
         y,
     }
+}
+
+/// Computes the notch geometry for a given animation progress (0.0 = closed, 1.0 = open)
+/// and DPI scale factor.
+///
+/// Top edge is always flat ($y = 0.0$), and the shape is centered horizontally within the canvas.
+/// Overshoot (progress > 1.0) is clamped to the maximum canvas bounds.
+#[must_use]
+#[allow(dead_code)] // Fase 1 legacy single-axis wrapper
+pub fn calculate_geometry(progress: f32, scale: f32) -> NotchGeometry {
+    calculate_geometry_per_axis(progress, progress, scale)
 }
 
 #[cfg(test)]

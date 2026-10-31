@@ -37,8 +37,8 @@ use windows::core::{Error, PCWSTR, Result, w};
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 use crate::core::layout;
+use crate::core::motion::{Motion, MotionDirection};
 use crate::core::renderer;
-use crate::core::spring::Spring;
 
 const TIMER_OPEN_DELAY: usize = 101;
 const TIMER_CLOSE_DELAY: usize = 102;
@@ -77,7 +77,7 @@ pub struct NotchWindowState {
     pub scale: f32,
     pub screen_w: i32,
 
-    pub spring: Spring,
+    pub motion: Motion,
     pub animating: bool,
     pub last_frame: Instant,
     pub dirty: bool,
@@ -111,7 +111,11 @@ impl NotchWindowState {
             return Ok(());
         }
 
-        let geom = layout::calculate_geometry(self.spring.pos, self.scale);
+        let geom = layout::calculate_geometry_per_axis(
+            self.motion.width_progress(),
+            self.motion.height_progress(),
+            self.scale,
+        );
         renderer::render_notch(&mut self.pixmap.as_mut(), &geom);
 
         let src = self.pixmap.data();
@@ -315,7 +319,7 @@ impl NotchWindow {
             canvas_h,
             scale: actual_scale,
             screen_w,
-            spring: Spring::new(0.0),
+            motion: Motion::new(),
             animating: false,
             last_frame: Instant::now(),
             dirty: true,
@@ -389,8 +393,10 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     if !state.is_tracking_leave {
                         state.is_tracking_leave = true;
                         start_tracking = true;
-                        if state.spring.pos > 0.1 || state.spring.target > 0.5 {
-                            state.spring.set_target(1.0);
+                        if state.motion.width_progress() > 0.1
+                            || state.motion.direction == MotionDirection::Opening
+                        {
+                            state.motion.open();
                             immediate_open = true;
                         }
                     }
@@ -459,7 +465,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         {
                             state.debug_timer_stats.open_delay_ticks += 1;
                         }
-                        state.spring.set_target(1.0);
+                        state.motion.open();
                         state.kick_anim(hwnd);
                     });
                 }
@@ -475,7 +481,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         {
                             state.debug_timer_stats.close_delay_ticks += 1;
                         }
-                        state.spring.set_target(0.0);
+                        state.motion.close();
                         state.kick_anim(hwnd);
                     });
                 }
@@ -491,7 +497,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         let dt = (now - state.last_frame).as_secs_f32();
                         state.last_frame = now;
 
-                        let settled = state.spring.step(dt);
+                        let settled = state.motion.step(dt);
                         state.dirty = true;
                         let _ = state.render_buffer();
                         (
@@ -761,20 +767,20 @@ mod tests {
 
     #[test]
     fn test_animation_stops_when_settled() {
-        let mut spring = Spring::new(0.0);
-        spring.set_target(1.0);
+        let mut motion = Motion::new();
+        motion.open();
 
         let dt = 0.016;
         let mut frames = 0;
-        while !spring.step(dt) {
+        while !motion.step(dt) {
             frames += 1;
             assert!(frames < 50, "Animation must settle in < 50 frames (<800ms)");
         }
 
-        assert!(spring.is_settled(), "Spring must be settled");
+        assert!(motion.is_settled(), "Motion must be settled");
         // Verify further step returns true (settled, no timer wakeup needed)
         assert!(
-            spring.step(dt),
+            motion.step(dt),
             "Subsequent steps must remain settled without animation"
         );
     }
