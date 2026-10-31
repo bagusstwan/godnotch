@@ -3,6 +3,7 @@
 //! Provides the primary interactive layered window for godnotch (T1.1..T1.3)
 //! as well as a lightweight message-only window for testing and headless messaging.
 
+use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
@@ -66,6 +67,7 @@ pub struct DebugTimerStats {
 
 /// Internal state of the interactive layered notch window.
 pub struct NotchWindowState {
+    #[allow(dead_code)] // Fase 1
     pub hwnd: HWND,
     pub mem_dc: HDC,
     pub bitmap: HBITMAP,
@@ -101,8 +103,10 @@ impl Drop for NotchWindowState {
 }
 
 impl NotchWindowState {
-    /// Renders the notch shape to the DIB section and presents via UpdateLayeredWindow.
-    pub fn render(&mut self) -> Result<()> {
+    /// Renders the notch shape into the local DIB pixel buffer.
+    /// This function performs purely CPU-bound rasterization and does NOT make
+    /// Win32 presentation calls, ensuring it is safe to execute while borrowed.
+    pub fn render_buffer(&mut self) -> Result<()> {
         if !self.dirty && !self.animating {
             return Ok(());
         }
@@ -114,37 +118,6 @@ impl NotchWindowState {
         // SAFETY: bits pointer was allocated by CreateDIBSection with size canvas_w * canvas_h * 4.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.bits, src.len()) };
         renderer::rgba_to_bgra_premultiplied(src, dst);
-
-        let ptdst = POINT {
-            x: (self.screen_w - self.canvas_w) / 2,
-            y: 0,
-        };
-        let size = SIZE {
-            cx: self.canvas_w,
-            cy: self.canvas_h,
-        };
-        let ptsrc = POINT { x: 0, y: 0 };
-        let blend = BLENDFUNCTION {
-            BlendOp: AC_SRC_OVER as u8,
-            BlendFlags: 0,
-            SourceConstantAlpha: 255,
-            AlphaFormat: AC_SRC_ALPHA as u8,
-        };
-
-        // SAFETY: Calling UpdateLayeredWindow to present the 32-bit premultiplied DIB buffer.
-        unsafe {
-            UpdateLayeredWindow(
-                self.hwnd,
-                None,
-                Some(&ptdst),
-                Some(&size),
-                self.mem_dc,
-                Some(&ptsrc),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            )?;
-        }
 
         self.dirty = false;
         Ok(())
@@ -178,6 +151,65 @@ impl NotchWindowState {
             let _ = KillTimer(hwnd, TIMER_ANIM);
         }
     }
+}
+
+/// Helper function to safely access NotchWindowState with a short mutable borrow,
+/// protecting against re-entrancy and aliasing violations during message dispatch.
+unsafe fn with_state<R>(
+    raw_cell: *const RefCell<NotchWindowState>,
+    f: impl FnOnce(&mut NotchWindowState) -> R,
+) -> Option<R> {
+    if raw_cell.is_null() {
+        return None;
+    }
+    // SAFETY: raw_cell points to a valid heap-allocated RefCell<NotchWindowState>
+    // before WM_NCDESTROY zeroes GWLP_USERDATA.
+    let cell = unsafe { &*raw_cell };
+    let mut borrow = cell.try_borrow_mut().ok()?;
+    Some(f(&mut borrow))
+}
+
+/// Presents the pre-rendered DIB buffer to the screen using UpdateLayeredWindow.
+/// This Win32 call is deliberately decoupled from any NotchWindowState borrow
+/// to guarantee re-entrancy safety.
+unsafe fn present_layered_window(
+    hwnd: HWND,
+    mem_dc: HDC,
+    screen_w: i32,
+    canvas_w: i32,
+    canvas_h: i32,
+) -> Result<()> {
+    let ptdst = POINT {
+        x: (screen_w - canvas_w) / 2,
+        y: 0,
+    };
+    let size = SIZE {
+        cx: canvas_w,
+        cy: canvas_h,
+    };
+    let ptsrc = POINT { x: 0, y: 0 };
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+
+    // SAFETY: Calling UpdateLayeredWindow to present the 32-bit premultiplied DIB buffer.
+    unsafe {
+        UpdateLayeredWindow(
+            hwnd,
+            None,
+            Some(&ptdst),
+            Some(&size),
+            mem_dc,
+            Some(&ptsrc),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        )?;
+    }
+    Ok(())
 }
 
 /// An interactive, transparent layered notch window at the top center of the screen.
@@ -274,7 +306,7 @@ impl NotchWindow {
 
         let pixmap = Pixmap::new(canvas.width, canvas.height).ok_or_else(Error::from_win32)?;
 
-        let mut state = Box::new(NotchWindowState {
+        let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
             mem_dc,
             bitmap,
@@ -291,15 +323,20 @@ impl NotchWindow {
             is_tracking_leave: false,
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
-        });
+        }));
 
-        // Initial render in closed state
-        state.render()?;
+        // Initial render in closed state into DIB section
+        state.borrow_mut().render_buffer()?;
 
         let raw_ptr = Box::into_raw(state);
-        // SAFETY: Storing the heap-allocated NotchWindowState pointer in window user data.
+        // SAFETY: Storing the heap-allocated RefCell<NotchWindowState> pointer in window user data.
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw_ptr as isize);
+        }
+
+        // SAFETY: Presenting initial layered window buffer outside any RefCell borrow.
+        unsafe {
+            let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
         }
 
         // SAFETY: Displaying window without activating or stealing focus.
@@ -332,21 +369,35 @@ impl Drop for NotchWindow {
 /// Window procedure for the interactive layered notch window.
 unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     // SAFETY: Retrieving user data pointer associated with this window.
-    let raw_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut NotchWindowState };
+    let raw_cell =
+        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
 
     // Guard: if user data pointer is null (e.g. before WM_NCCREATE or after WM_NCDESTROY zeroing),
     // immediately forward to default window procedure without dereferencing.
-    if raw_ptr.is_null() {
+    if raw_cell.is_null() {
         return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
     }
 
-    // SAFETY: raw_ptr is guaranteed non-null and valid until WM_NCDESTROY cleans it up.
-    let state = unsafe { &mut *raw_ptr };
-
     match msg {
         WM_MOUSEMOVE => {
-            if !state.is_tracking_leave {
-                state.is_tracking_leave = true;
+            let mut start_tracking = false;
+            let mut immediate_open = false;
+
+            // SAFETY: raw_cell points to a valid RefCell<NotchWindowState> associated with hwnd.
+            unsafe {
+                with_state(raw_cell, |state| {
+                    if !state.is_tracking_leave {
+                        state.is_tracking_leave = true;
+                        start_tracking = true;
+                        if state.spring.pos > 0.1 || state.spring.target > 0.5 {
+                            state.spring.set_target(1.0);
+                            immediate_open = true;
+                        }
+                    }
+                });
+            }
+
+            if start_tracking {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE,
@@ -356,18 +407,15 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 // SAFETY: Requesting WM_MOUSELEAVE notification when cursor departs non-transparent area.
                 unsafe {
                     let _ = TrackMouseEvent(&mut tme);
-                }
-
-                // Cancel pending close delay if cursor re-entered
-                // SAFETY: Canceling close delay timer.
-                unsafe {
+                    // Cancel pending close delay if cursor re-entered
                     let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
                 }
 
-                if state.spring.pos > 0.1 || state.spring.target > 0.5 {
-                    // Already open or opening: immediately target open without delay
-                    state.spring.set_target(1.0);
-                    state.kick_anim(hwnd);
+                if immediate_open {
+                    // SAFETY: raw_cell is valid; kicking animation timer.
+                    unsafe {
+                        with_state(raw_cell, |state| state.kick_anim(hwnd));
+                    }
                 } else {
                     // Closed state: start 80ms open delay timer (one-shot)
                     // SAFETY: Starting open delay timer.
@@ -380,17 +428,17 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSELEAVE => {
-            state.is_tracking_leave = false;
-
-            // Cancel pending open delay if cursor left before 80ms elapsed
-            // SAFETY: Canceling open delay timer.
+            // SAFETY: raw_cell is valid; resetting leave tracking state.
             unsafe {
-                let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
+                with_state(raw_cell, |state| {
+                    state.is_tracking_leave = false;
+                });
             }
 
-            // Start 300ms close delay timer (one-shot)
-            // SAFETY: Starting close delay timer.
+            // Cancel pending open delay if cursor left before 80ms elapsed, and start 300ms close delay
+            // SAFETY: Canceling open delay timer and starting close delay timer.
             unsafe {
+                let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
                 SetTimer(hwnd, TIMER_CLOSE_DELAY, CLOSE_DELAY_MS, None);
             }
             LRESULT(0)
@@ -400,42 +448,73 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let timer_id = wp.0;
 
             if timer_id == TIMER_OPEN_DELAY {
-                #[cfg(debug_assertions)]
-                {
-                    state.debug_timer_stats.open_delay_ticks += 1;
-                }
                 // SAFETY: Killing one-shot open delay timer.
                 unsafe {
                     let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
                 }
-                state.spring.set_target(1.0);
-                state.kick_anim(hwnd);
-            } else if timer_id == TIMER_CLOSE_DELAY {
-                #[cfg(debug_assertions)]
-                {
-                    state.debug_timer_stats.close_delay_ticks += 1;
+                // SAFETY: raw_cell is valid; starting open spring animation.
+                unsafe {
+                    with_state(raw_cell, |state| {
+                        #[cfg(debug_assertions)]
+                        {
+                            state.debug_timer_stats.open_delay_ticks += 1;
+                        }
+                        state.spring.set_target(1.0);
+                        state.kick_anim(hwnd);
+                    });
                 }
+            } else if timer_id == TIMER_CLOSE_DELAY {
                 // SAFETY: Killing one-shot close delay timer.
                 unsafe {
                     let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
                 }
-                state.spring.set_target(0.0);
-                state.kick_anim(hwnd);
-            } else if timer_id == TIMER_ANIM {
-                #[cfg(debug_assertions)]
-                {
-                    state.debug_timer_stats.anim_ticks += 1;
+                // SAFETY: raw_cell is valid; starting close spring animation.
+                unsafe {
+                    with_state(raw_cell, |state| {
+                        #[cfg(debug_assertions)]
+                        {
+                            state.debug_timer_stats.close_delay_ticks += 1;
+                        }
+                        state.spring.set_target(0.0);
+                        state.kick_anim(hwnd);
+                    });
                 }
-                let now = Instant::now();
-                let dt = (now - state.last_frame).as_secs_f32();
-                state.last_frame = now;
+            } else if timer_id == TIMER_ANIM {
+                // SAFETY: raw_cell is valid; advancing spring animation frame.
+                let frame_res = unsafe {
+                    with_state(raw_cell, |state| {
+                        #[cfg(debug_assertions)]
+                        {
+                            state.debug_timer_stats.anim_ticks += 1;
+                        }
+                        let now = Instant::now();
+                        let dt = (now - state.last_frame).as_secs_f32();
+                        state.last_frame = now;
 
-                let settled = state.spring.step(dt);
-                state.dirty = true;
-                let _ = state.render();
+                        let settled = state.spring.step(dt);
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        (
+                            settled,
+                            state.mem_dc,
+                            state.screen_w,
+                            state.canvas_w,
+                            state.canvas_h,
+                        )
+                    })
+                };
 
-                if settled {
-                    state.stop_anim(hwnd);
+                if let Some((settled, mem_dc, screen_w, canvas_w, canvas_h)) = frame_res {
+                    // SAFETY: Presenting layered window without holding any borrow on state.
+                    unsafe {
+                        let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                    }
+                    if settled {
+                        // SAFETY: raw_cell is valid; stopping animation timer on settle.
+                        unsafe {
+                            with_state(raw_cell, |state| state.stop_anim(hwnd));
+                        }
+                    }
                 }
             }
             LRESULT(0)
@@ -443,6 +522,8 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
         WM_RBUTTONUP => {
             // Right-click context menu (temporary exit path for Phase 1)
+            // Notice: Absolutely NO borrow on NotchWindowState is held while running
+            // the modal TrackPopupMenu message loop or calling DestroyWindow.
             // SAFETY: Creating and displaying popup menu on right-click.
             unsafe {
                 if let Ok(menu) = CreatePopupMenu() {
@@ -473,13 +554,26 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             // New DPI scale
             let new_dpi = (wp.0 & 0xFFFF) as u32;
             let new_scale = new_dpi as f32 / 96.0;
-            state.scale = new_scale;
 
-            let canvas = layout::canvas_size(new_scale);
-            state.canvas_w = canvas.width as i32;
-            state.canvas_h = canvas.height as i32;
-            state.dirty = true;
-            let _ = state.render();
+            // SAFETY: raw_cell is valid; updating scale and recalculating buffer.
+            let dpi_res = unsafe {
+                with_state(raw_cell, |state| {
+                    state.scale = new_scale;
+                    let canvas = layout::canvas_size(new_scale);
+                    state.canvas_w = canvas.width as i32;
+                    state.canvas_h = canvas.height as i32;
+                    state.dirty = true;
+                    let _ = state.render_buffer();
+                    (state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h)
+                })
+            };
+
+            if let Some((mem_dc, screen_w, canvas_w, canvas_h)) = dpi_res {
+                // SAFETY: Presenting window at new scale without holding state borrow.
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+            }
             LRESULT(0)
         }
 
@@ -495,11 +589,11 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_NCDESTROY => {
-            // SAFETY: Zeroing out GWLP_USERDATA BEFORE deallocating the heap-allocated NotchWindowState
+            // SAFETY: Zeroing out GWLP_USERDATA BEFORE deallocating the heap-allocated RefCell<NotchWindowState>
             // to prevent Use-After-Free in any subsequent or re-entrant window procedure calls.
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                let _ = Box::from_raw(raw_ptr);
+                let _ = Box::from_raw(raw_cell as *mut RefCell<NotchWindowState>);
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
         }
@@ -687,36 +781,95 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    fn test_timer_killed_upon_settled() {
-        // Verify DebugTimerStats logic and that no timer remains active once settled
-        let mut stats = DebugTimerStats::default();
-        let mut spring = Spring::new(0.0);
-        spring.set_target(1.0);
-        stats.is_anim_timer_active = true;
+    fn test_real_notch_window_timer_stops_when_settled() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PM_REMOVE, PeekMessageW, SendMessageW, TranslateMessage,
+        };
 
-        let dt = 0.016;
-        while !spring.step(dt) {
-            stats.anim_ticks += 1;
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create test notch window");
+        let hwnd = notch.hwnd();
+
+        // Send synthetic WM_MOUSEMOVE to trigger hover open delay and animation
+        unsafe {
+            SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
         }
 
-        // Settled: stop_anim should kill the timer
-        stats.is_anim_timer_active = false;
+        // Pump messages until animation settles (80ms open delay + ~450ms animation)
+        let start = Instant::now();
+        let timeout = Duration::from_millis(2000);
+        let mut msg = MSG::default();
+        let mut settled = false;
+
+        while start.elapsed() < timeout {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            let raw_cell = unsafe {
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState>
+            };
+            if let Some(is_active) =
+                unsafe { with_state(raw_cell, |s| s.debug_timer_stats.is_anim_timer_active) }
+            {
+                let ticks = unsafe {
+                    with_state(raw_cell, |s| s.debug_timer_stats.anim_ticks).unwrap_or(0)
+                };
+                if !is_active && ticks > 0 {
+                    settled = true;
+                    break;
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(15));
+        }
 
         assert!(
-            !stats.is_anim_timer_active,
+            settled,
+            "Real notch window failed to start and settle within timeout"
+        );
+
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+        let ticks_at_settle = unsafe {
+            with_state(raw_cell, |s| s.debug_timer_stats.anim_ticks).expect("state exists")
+        };
+        let is_active = unsafe {
+            with_state(raw_cell, |s| s.debug_timer_stats.is_anim_timer_active)
+                .expect("state exists")
+        };
+        assert!(
+            !is_active,
             "Animation timer must be killed upon reaching settled state"
         );
-        assert!(stats.anim_ticks > 0, "Animation timer ticked during motion");
+        assert!(
+            ticks_at_settle > 0,
+            "Animation timer must have ticked during motion"
+        );
 
-        let ticks_at_rest = stats.anim_ticks;
-        // Simulating idle frames when settled: spring.step returns true immediately
-        for _ in 0..10 {
-            assert!(spring.step(dt));
+        // Pump messages for an additional 300 ms while idle
+        let idle_start = Instant::now();
+        while idle_start.elapsed() < Duration::from_millis(300) {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
         }
-        // anim_ticks must NOT increase when idle
+
+        // Verify that anim_ticks did not increase during idle
+        let ticks_after_idle = unsafe {
+            with_state(raw_cell, |s| s.debug_timer_stats.anim_ticks).expect("state exists")
+        };
         assert_eq!(
-            stats.anim_ticks, ticks_at_rest,
-            "No animation timer ticks may occur while settled"
+            ticks_after_idle, ticks_at_settle,
+            "No animation timer ticks may occur after settled"
         );
     }
 }
