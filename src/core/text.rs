@@ -41,12 +41,22 @@ pub struct CachedGlyph {
     pub bitmap: Vec<u8>,
 }
 
+/// Startup profiling breakdown for font loading and glyph rasterization.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FontInitProfile {
+    pub read_file_us: u64,
+    pub parse_font_us: u64,
+    pub rasterize_glyphs_us: u64,
+    pub glyph_count: usize,
+}
+
 /// Single-font text renderer with pre-rasterized glyph cache for minimal memory footprint.
 #[allow(dead_code)] // Fase 1 T1.4
 pub struct FontRenderer {
     cache: HashMap<(char, u32), CachedGlyph>,
     digit_advance_cache: HashMap<u32, f32>,
     has_loaded_font: bool,
+    pub profile: FontInitProfile,
 }
 
 impl FontRenderer {
@@ -68,14 +78,19 @@ impl FontRenderer {
         let mut cache = HashMap::new();
         let mut digit_advance_cache = HashMap::new();
         let mut has_loaded_font = false;
+        let mut profile = FontInitProfile::default();
 
         let mut font = None;
         for &path in &FONT_CANDIDATE_PATHS {
-            if let Ok(bytes) = std::fs::read(path)
-                && let Ok(f) = Font::from_bytes(bytes, FontSettings::default())
-            {
-                font = Some(f);
-                break;
+            let t_read_start = std::time::Instant::now();
+            if let Ok(bytes) = std::fs::read(path) {
+                profile.read_file_us += t_read_start.elapsed().as_micros() as u64;
+                let t_parse_start = std::time::Instant::now();
+                if let Ok(f) = Font::from_bytes(bytes, FontSettings::default()) {
+                    profile.parse_font_us += t_parse_start.elapsed().as_micros() as u64;
+                    font = Some(f);
+                    break;
+                }
             }
         }
 
@@ -83,6 +98,7 @@ impl FontRenderer {
             has_loaded_font = true;
             let chars = Self::required_chars();
 
+            let t_raster_start = std::time::Instant::now();
             for &size in sizes {
                 let mut max_digit_adv = 0.0_f32;
                 for &ch in &chars {
@@ -105,6 +121,8 @@ impl FontRenderer {
                 }
                 digit_advance_cache.insert(size, max_digit_adv);
             }
+            profile.rasterize_glyphs_us = t_raster_start.elapsed().as_micros() as u64;
+            profile.glyph_count = cache.len();
             // `font` is dropped here, reclaiming all parsed font tables and raw buffer memory!
         } else {
             #[cfg(debug_assertions)]
@@ -115,6 +133,7 @@ impl FontRenderer {
             cache,
             digit_advance_cache,
             has_loaded_font,
+            profile,
         }
     }
 

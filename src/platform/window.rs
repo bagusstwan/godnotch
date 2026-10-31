@@ -566,14 +566,48 @@ unsafe fn present_layered_window(
     Ok(())
 }
 
+/// Startup profiling metrics covering all initial phases to first pixel presentation.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(dead_code)]
+pub struct StartupProfile {
+    pub window_create_us: u64,
+    pub font_init: crate::core::text::FontInitProfile,
+    pub first_render_us: u64,
+    pub first_present_us: u64,
+    pub total_to_presented_us: u64,
+}
+
+impl StartupProfile {
+    #[allow(dead_code)]
+    pub fn print(&self) {
+        println!(
+            "\n[STARTUP_PROFILE] Initial launch breakdown (main -> UpdateLayeredWindow presented):\n  1. Win32 Window & DC Creation   : {:7.3} ms\n  2. Font File Read               : {:7.3} ms\n  3. Font Parsing (fontdue)       : {:7.3} ms\n  4. Pre-rasterization ({} glifs): {:7.3} ms\n  5. Initial Buffer Rasterize     : {:7.3} ms\n  6. Initial UpdateLayeredWindow  : {:7.3} ms\n  ------------------------------------------------\n  TOTAL time to first pixel       : {:7.3} ms",
+            self.window_create_us as f64 / 1000.0,
+            self.font_init.read_file_us as f64 / 1000.0,
+            self.font_init.parse_font_us as f64 / 1000.0,
+            self.font_init.glyph_count,
+            self.font_init.rasterize_glyphs_us as f64 / 1000.0,
+            self.first_render_us as f64 / 1000.0,
+            self.first_present_us as f64 / 1000.0,
+            self.total_to_presented_us as f64 / 1000.0
+        );
+    }
+}
+
 /// An interactive, transparent layered notch window at the top center of the screen.
 pub struct NotchWindow {
     hwnd: HWND,
+    #[allow(dead_code)] // Digunakan untuk inspeksi profil pengujian
+    pub startup_profile: StartupProfile,
 }
 
 impl NotchWindow {
     /// Creates and shows the layered notch window.
     pub fn create() -> Result<Self> {
+        let t_start = Instant::now();
+
+        // Phase 1: Window & DC Creation
+        let t_win_start = Instant::now();
         // SAFETY: Retrieving executable instance module handle.
         let instance = unsafe { GetModuleHandleW(None)? };
         let class_name = w!("GodNotchLayeredWindow");
@@ -659,12 +693,15 @@ impl NotchWindow {
         }
 
         let pixmap = Pixmap::new(canvas.width, canvas.height).ok_or_else(Error::from_win32)?;
+        let window_create_us = t_win_start.elapsed().as_micros() as u64;
 
+        // Phase 2: Font initialization & glyph caching
         // SAFETY: Querying current local system time.
         let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
         let time_format = query_system_time_format();
         let language = query_user_locale_language();
         let font_renderer = FontRenderer::new();
+        let font_init_profile = font_renderer.profile;
 
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
@@ -697,8 +734,10 @@ impl NotchWindow {
             frame_logger: FrameLogger::init(),
         }));
 
-        // Initial render in closed state into DIB section
+        // Phase 3: Initial render in closed state into DIB section
+        let t_render_start = Instant::now();
         state.borrow_mut().render_buffer()?;
+        let first_render_us = t_render_start.elapsed().as_micros() as u64;
 
         let raw_ptr = Box::into_raw(state);
         // SAFETY: Storing the heap-allocated RefCell<NotchWindowState> pointer in window user data.
@@ -706,10 +745,25 @@ impl NotchWindow {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw_ptr as isize);
         }
 
+        // Phase 4: Initial UpdateLayeredWindow presentation
+        let t_present_start = Instant::now();
         // SAFETY: Presenting initial layered window buffer outside any RefCell borrow.
         unsafe {
             let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
         }
+        let first_present_us = t_present_start.elapsed().as_micros() as u64;
+        let total_to_presented_us = t_start.elapsed().as_micros() as u64;
+
+        let startup_profile = StartupProfile {
+            window_create_us,
+            font_init: font_init_profile,
+            first_render_us,
+            first_present_us,
+            total_to_presented_us,
+        };
+
+        #[cfg(debug_assertions)]
+        startup_profile.print();
 
         // SAFETY: Displaying window without activating or stealing focus.
         unsafe {
@@ -723,7 +777,10 @@ impl NotchWindow {
             SetTimer(hwnd, TIMER_MINUTE_CLOCK, delay_ms, None);
         }
 
-        Ok(Self { hwnd })
+        Ok(Self {
+            hwnd,
+            startup_profile,
+        })
     }
 
     /// Returns the HWND handle.
@@ -1769,5 +1826,15 @@ mod tests {
         println!(
             "[B4 TIMECHANGE] Successfully handled WM_TIMECHANGE, re-queried formats and refreshed timer"
         );
+    }
+
+    #[test]
+    fn test_startup_phase_profiling() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for startup profiling");
+        notch.startup_profile.print();
+        assert!(!notch.hwnd().is_invalid());
+        assert!(notch.startup_profile.total_to_presented_us > 0);
     }
 }

@@ -8,6 +8,9 @@ mod platform;
 use windows::core::w;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    let t_main = std::time::Instant::now();
+
     // 1. Single instance check using named mutex
     // If another instance is already running, exit cleanly and silently.
     let mutex_name = w!("Local\\godnotch_single_instance");
@@ -30,6 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 4. Create and display interactive layered notch window (T1.1..T1.3)
     let _notch_window = platform::NotchWindow::create()?;
+
+    #[cfg(debug_assertions)]
+    println!(
+        "[STARTUP_PROFILE] Total main() startup to window presented: {:.3} ms",
+        t_main.elapsed().as_secs_f64() * 1000.0
+    );
 
     // 5. Run blocking Win32 message loop (GetMessageW)
     platform::run_message_loop()?;
