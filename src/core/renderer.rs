@@ -99,7 +99,8 @@ mod tests {
 
     #[test]
     fn test_render_notch_output() {
-        let mut pixmap = Pixmap::new(460, 150).unwrap();
+        let canvas = crate::core::layout::canvas_size(1.0);
+        let mut pixmap = Pixmap::new(canvas.width, canvas.height).unwrap();
         let geom = crate::core::layout::calculate_geometry(0.0, 1.0);
 
         render_notch(&mut pixmap.as_mut(), &geom);
@@ -110,8 +111,9 @@ mod tests {
         // Top-left corner outside the notch (e.g. x=0, y=0) must be transparent
         assert_eq!(data[0..4], [0, 0, 0, 0]);
 
-        // Center of the notch (x=230, y=10) must be solid black
-        let center_idx = (10 * 460 + 230) * 4;
+        // Center of the notch (x = canvas.width / 2, y = 10) must be solid black
+        let center_x = canvas.width / 2;
+        let center_idx = (10 * canvas.width + center_x) as usize * 4;
         assert_eq!(
             &data[center_idx..center_idx + 4],
             &[0, 0, 0, 255],

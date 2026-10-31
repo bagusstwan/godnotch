@@ -2,16 +2,24 @@
 //!
 //! Pure mathematical calculations for notch dimensions, corner radii, and canvas sizes.
 
-pub const CANVAS_WIDTH_LOGICAL: f32 = 460.0;
-pub const CANVAS_HEIGHT_LOGICAL: f32 = 150.0;
+/// Logical width of the backing window canvas.
+pub const CANVAS_WIDTH_LOGICAL: f32 = 400.0;
+/// Logical height of the backing window canvas.
+pub const CANVAS_HEIGHT_LOGICAL: f32 = 130.0;
 
-pub const CLOSED_WIDTH_LOGICAL: f32 = 190.0;
-pub const CLOSED_HEIGHT_LOGICAL: f32 = 34.0;
-pub const CLOSED_RADIUS_LOGICAL: f32 = 10.0;
+/// Logical width of the notch in closed state.
+pub const CLOSED_WIDTH_LOGICAL: f32 = 164.0;
+/// Logical height of the notch in closed state.
+pub const CLOSED_HEIGHT_LOGICAL: f32 = 30.0;
+/// Logical corner radius of the notch in closed state.
+pub const CLOSED_RADIUS_LOGICAL: f32 = 9.0;
 
-pub const OPEN_WIDTH_LOGICAL: f32 = 420.0;
-pub const OPEN_HEIGHT_LOGICAL: f32 = 130.0;
-pub const OPEN_RADIUS_LOGICAL: f32 = 28.0;
+/// Logical width of the notch in open state.
+pub const OPEN_WIDTH_LOGICAL: f32 = 360.0;
+/// Logical height of the notch in open state.
+pub const OPEN_HEIGHT_LOGICAL: f32 = 112.0;
+/// Logical corner radius of the notch in open state.
+pub const OPEN_RADIUS_LOGICAL: f32 = 24.0;
 
 /// Physical dimensions of the backing window canvas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,8 +109,8 @@ mod tests {
         let scales = [1.0, 1.25, 1.5, 2.0];
         for s in scales {
             let cs = canvas_size(s);
-            assert_eq!(cs.width, (460.0 * s).round() as u32);
-            assert_eq!(cs.height, (150.0 * s).round() as u32);
+            assert_eq!(cs.width, (CANVAS_WIDTH_LOGICAL * s).round() as u32);
+            assert_eq!(cs.height, (CANVAS_HEIGHT_LOGICAL * s).round() as u32);
         }
     }
 
@@ -113,9 +121,9 @@ mod tests {
             let geom = calculate_geometry(0.0, s);
             let canvas = canvas_size(s);
 
-            let expected_w = (190.0 * s).round();
-            let expected_h = (34.0 * s).round();
-            let expected_r = (10.0 * s).round();
+            let expected_w = (CLOSED_WIDTH_LOGICAL * s).round();
+            let expected_h = (CLOSED_HEIGHT_LOGICAL * s).round();
+            let expected_r = (CLOSED_RADIUS_LOGICAL * s).round();
 
             assert!((geom.width - expected_w).abs() <= 1.0);
             assert!((geom.height - expected_h).abs() <= 1.0);
@@ -135,9 +143,9 @@ mod tests {
             let geom = calculate_geometry(1.0, s);
             let canvas = canvas_size(s);
 
-            let expected_w = (420.0 * s).round();
-            let expected_h = (130.0 * s).round();
-            let expected_r = (28.0 * s).round();
+            let expected_w = (OPEN_WIDTH_LOGICAL * s).round();
+            let expected_h = (OPEN_HEIGHT_LOGICAL * s).round();
+            let expected_r = (OPEN_RADIUS_LOGICAL * s).round();
 
             assert!((geom.width - expected_w).abs() <= 1.0);
             assert!((geom.height - expected_h).abs() <= 1.0);
@@ -150,22 +158,35 @@ mod tests {
     }
 
     #[test]
-    fn test_overshoot_clamping() {
-        // Test with 6% spring overshoot (progress = 1.06)
-        let s = 1.0;
-        let geom = calculate_geometry(1.06, s);
-        let canvas = canvas_size(s);
+    fn test_overshoot_and_undershoot_bounds() {
+        // Maximum opening overshoot: width ~5.43% (progress_w=1.0543), height ~2.84% (progress_h=1.0284)
+        let scales = [1.0, 1.25, 1.5, 2.0];
+        for s in scales {
+            let canvas = canvas_size(s);
+            let geom_overshoot = calculate_geometry_per_axis(1.0543, 1.0284, s);
 
-        assert!(geom.width > 420.0, "Overshoot should expand width");
-        assert!(
-            geom.width <= canvas.width as f32,
-            "Width must not exceed canvas"
-        );
-        assert!(geom.height > 130.0, "Overshoot should expand height");
-        assert!(
-            geom.height <= canvas.height as f32,
-            "Height must not exceed canvas"
-        );
-        assert_eq!(geom.y, 0.0);
+            assert!(
+                geom_overshoot.width <= canvas.width as f32,
+                "Width with overshoot must not exceed canvas width at scale {s}"
+            );
+            assert!(
+                geom_overshoot.height <= canvas.height as f32,
+                "Height with overshoot must not exceed canvas height at scale {s}"
+            );
+
+            // Undershoot during close: progress_w = -0.001, progress_h = -0.001
+            let geom_undershoot = calculate_geometry_per_axis(-0.001, -0.001, s);
+            let min_w = CLOSED_WIDTH_LOGICAL * s * 0.5;
+            let min_h = CLOSED_HEIGHT_LOGICAL * s * 0.5;
+
+            assert!(
+                geom_undershoot.width >= min_w,
+                "Width must remain above minimum threshold during undershoot"
+            );
+            assert!(
+                geom_undershoot.height >= min_h,
+                "Height must remain above minimum threshold during undershoot"
+            );
+        }
     }
 }
