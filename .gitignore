@@ -1,0 +1,24 @@
+@'
+# Build
+/target/
+**/*.rs.bk
+*.pdb
+
+# Dokumentasi internal
+/docs/
+
+/AGENTS.md
+
+# Editor dan agent
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Lokal
+*.log
+*.tmp
+/dist/
+'@ | Set-Content -Path .gitignore -Encoding ascii
