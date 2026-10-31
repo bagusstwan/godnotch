@@ -222,38 +222,86 @@ mod tests {
 
     #[test]
     fn test_settling_times() {
-        // Test BUKA settling time (target: <= 600 ms)
-        let mut motion_open = Motion::new();
-        motion_open.open();
+        let sim_axis =
+            |k: f32, zeta: f32, range_px: f32, target: f32, initial: f32, dt: f32| -> f32 {
+                let mut s = Spring::with_params(initial, k, zeta);
+                s.set_target(target);
+                let mut t = 0.0_f32;
+                while !s.step(dt, range_px) && t < 2.0 {
+                    t += dt;
+                }
+                t
+            };
 
-        let dt = 0.008; // 125 Hz simulation step
-        let mut open_time = 0.0_f32;
-        while !motion_open.step(dt) && open_time < 2.0 {
-            open_time += dt;
+        for &fps in &[60.0_f32, 144.0_f32] {
+            let dt = 1.0 / fps;
+            let t_open_w = sim_axis(
+                PRESET_OPEN_WIDTH.k,
+                PRESET_OPEN_WIDTH.zeta,
+                MOTION_RANGE_WIDTH,
+                1.0,
+                0.0,
+                dt,
+            );
+            let t_open_h = sim_axis(
+                PRESET_OPEN_HEIGHT.k,
+                PRESET_OPEN_HEIGHT.zeta,
+                MOTION_RANGE_HEIGHT,
+                1.0,
+                0.0,
+                dt,
+            );
+            let t_close_w = sim_axis(
+                PRESET_CLOSE_WIDTH.k,
+                PRESET_CLOSE_WIDTH.zeta,
+                MOTION_RANGE_WIDTH,
+                0.0,
+                1.0,
+                dt,
+            );
+            let t_close_h = sim_axis(
+                PRESET_CLOSE_HEIGHT.k,
+                PRESET_CLOSE_HEIGHT.zeta,
+                MOTION_RANGE_HEIGHT,
+                0.0,
+                1.0,
+                dt,
+            );
+
+            println!(
+                "[A2-a SETTLING_TIME @ {:.0} Hz (dt={:.5}s)]\n  BUKA width : {:.3}s ({:.1}ms)\n  BUKA height: {:.3}s ({:.1}ms)\n  TUTUP width: {:.3}s ({:.1}ms)\n  TUTUP height: {:.3}s ({:.1}ms)",
+                fps,
+                dt,
+                t_open_w,
+                t_open_w * 1000.0,
+                t_open_h,
+                t_open_h * 1000.0,
+                t_close_w,
+                t_close_w * 1000.0,
+                t_close_h,
+                t_close_h * 1000.0
+            );
+
+            assert!(
+                t_open_w <= 0.600,
+                "BUKA width must settle <= 600ms, got {:.1}ms",
+                t_open_w * 1000.0
+            );
+            assert!(
+                t_open_h <= 0.600,
+                "BUKA height must settle <= 600ms, got {:.1}ms",
+                t_open_h * 1000.0
+            );
+            assert!(
+                t_close_w <= 0.500,
+                "TUTUP width must settle <= 500ms, got {:.1}ms",
+                t_close_w * 1000.0
+            );
+            assert!(
+                t_close_h <= 0.500,
+                "TUTUP height must settle <= 500ms, got {:.1}ms",
+                t_close_h * 1000.0
+            );
         }
-
-        assert!(
-            open_time <= 0.600,
-            "OPEN settling time must be <= 600ms, measured: {:.1}ms",
-            open_time * 1000.0
-        );
-
-        // Test TUTUP settling time (target: <= 500 ms)
-        let mut motion_close = Motion::new();
-        motion_close.open();
-        // Settle open first
-        while !motion_close.step(dt) {}
-
-        motion_close.close();
-        let mut close_time = 0.0_f32;
-        while !motion_close.step(dt) && close_time < 2.0 {
-            close_time += dt;
-        }
-
-        assert!(
-            close_time <= 0.500,
-            "CLOSE settling time must be <= 500ms, measured: {:.1}ms",
-            close_time * 1000.0
-        );
     }
 }
