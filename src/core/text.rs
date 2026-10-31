@@ -5,9 +5,12 @@
 //! notch sizes, then immediately frees the font to strictly comply with the <= 1.5 MB
 //! memory budget (ADR 008).
 
-use fontdue::{Font, FontSettings};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use tiny_skia::PixmapMut;
+
+/// Maximum number of glyphs retained in the bounded cache.
+pub const MAX_GLYPH_CACHE_ENTRIES: usize = 256;
 
 /// Candidate system font paths checked in strict priority order.
 pub const FONT_CANDIDATE_PATHS: [&str; 3] = [
@@ -15,6 +18,9 @@ pub const FONT_CANDIDATE_PATHS: [&str; 3] = [
     r"C:\Windows\Fonts\segoeui.ttf", // Segoe UI Regular (Fallback 1)
     r"C:\Windows\Fonts\arial.ttf",   // Arial (Fallback 2)
 ];
+
+/// Initial characters pre-rasterized during startup (closed clock only).
+pub const STARTUP_GLYPH_CHARS: [char; 11] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', ':'];
 
 /// Corpus of all characters required for clock and localized date display.
 pub const REQUIRED_GLYPH_CHARS: &str = concat!(
@@ -50,11 +56,123 @@ pub struct FontInitProfile {
     pub glyph_count: usize,
 }
 
-/// Single-font text renderer with pre-rasterized glyph cache for minimal memory footprint.
+struct GlyphPathBuilder {
+    builder: tiny_skia::PathBuilder,
+    scale: f32,
+    x_offset: f32,
+    y_offset: f32,
+    height: f32,
+}
+
+impl ttf_parser::OutlineBuilder for GlyphPathBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let px = x * self.scale - self.x_offset;
+        let py = (self.y_offset + self.height) - (y * self.scale);
+        self.builder.move_to(px, py);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let px = x * self.scale - self.x_offset;
+        let py = (self.y_offset + self.height) - (y * self.scale);
+        self.builder.line_to(px, py);
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let p1x = x1 * self.scale - self.x_offset;
+        let p1y = (self.y_offset + self.height) - (y1 * self.scale);
+        let px = x * self.scale - self.x_offset;
+        let py = (self.y_offset + self.height) - (y * self.scale);
+        self.builder.quad_to(p1x, p1y, px, py);
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let p1x = x1 * self.scale - self.x_offset;
+        let p1y = (self.y_offset + self.height) - (y1 * self.scale);
+        let p2x = x2 * self.scale - self.x_offset;
+        let p2y = (self.y_offset + self.height) - (y2 * self.scale);
+        let px = x * self.scale - self.x_offset;
+        let py = (self.y_offset + self.height) - (y * self.scale);
+        self.builder.cubic_to(p1x, p1y, p2x, p2y, px, py);
+    }
+
+    fn close(&mut self) {
+        self.builder.close();
+    }
+}
+
+/// Rasterizes a single glyph from a TrueType face using tiny-skia antialiased masking.
+#[allow(dead_code)]
+pub fn rasterize_glyph_ttf(face: &ttf_parser::Face, ch: char, px_size: u32) -> Option<CachedGlyph> {
+    let glyph_id = face.glyph_index(ch)?;
+    let scale = px_size as f32 / face.units_per_em() as f32;
+    let advance_width = face.glyph_hor_advance(glyph_id).unwrap_or(0) as f32 * scale;
+
+    let bbox = face.glyph_bounding_box(glyph_id);
+    if let Some(rect) = bbox {
+        let xmin_px = rect.x_min as f32 * scale;
+        let xmax_px = rect.x_max as f32 * scale;
+        let ymin_px = rect.y_min as f32 * scale;
+        let ymax_px = rect.y_max as f32 * scale;
+
+        let x_offset = xmin_px.floor() as i32;
+        let y_offset = ymin_px.floor() as i32;
+        let width = (xmax_px.ceil() as i32 - x_offset).max(1) as usize;
+        let height = (ymax_px.ceil() as i32 - y_offset).max(1) as usize;
+
+        let pb = tiny_skia::PathBuilder::new();
+        let mut actual_builder = GlyphPathBuilder {
+            builder: pb,
+            scale,
+            x_offset: x_offset as f32,
+            y_offset: y_offset as f32,
+            height: height as f32,
+        };
+
+        face.outline_glyph(glyph_id, &mut actual_builder);
+
+        let bitmap = if let Some(path) = actual_builder.builder.finish() {
+            if let Some(mut mask) = tiny_skia::Mask::new(width as u32, height as u32) {
+                mask.fill_path(
+                    &path,
+                    tiny_skia::FillRule::Winding,
+                    true,
+                    tiny_skia::Transform::identity(),
+                );
+                mask.data().to_vec()
+            } else {
+                vec![0u8; width * height]
+            }
+        } else {
+            vec![0u8; width * height]
+        };
+
+        Some(CachedGlyph {
+            width,
+            height,
+            x_offset,
+            y_offset,
+            advance_width,
+            bitmap,
+        })
+    } else {
+        // Whitespace or empty glyph (e.g. space)
+        Some(CachedGlyph {
+            width: 0,
+            height: 0,
+            x_offset: 0,
+            y_offset: 0,
+            advance_width,
+            bitmap: Vec::new(),
+        })
+    }
+}
+
+/// Single-font text renderer with bounded lazy glyph cache.
 #[allow(dead_code)] // Fase 1 T1.4
 pub struct FontRenderer {
-    cache: HashMap<(char, u32), CachedGlyph>,
-    digit_advance_cache: HashMap<u32, f32>,
+    font_data: Option<Vec<u8>>,
+    cache: RefCell<HashMap<(char, u32), CachedGlyph>>,
+    digit_advance_cache: RefCell<HashMap<u32, f32>>,
     has_loaded_font: bool,
     pub profile: FontInitProfile,
 }
@@ -70,66 +188,80 @@ impl FontRenderer {
         chars
     }
 
-    /// Initializes the font renderer and pre-rasterizes glyphs for the specified pixel sizes.
-    /// Immediately frees the Font structure to enforce the strict <= 1.5 MB memory budget.
+    /// Creates an empty font renderer with no loaded font (fallback / test mode).
+    #[must_use]
+    #[allow(dead_code)] // Fase 1 T1.4
+    pub fn new_empty() -> Self {
+        Self {
+            font_data: None,
+            cache: RefCell::new(HashMap::new()),
+            digit_advance_cache: RefCell::new(HashMap::new()),
+            has_loaded_font: false,
+            profile: FontInitProfile::default(),
+        }
+    }
+
+    /// Initializes the font renderer and pre-rasterizes ONLY startup digits for closed notch.
+    /// Remaining glyphs are lazily rasterized on demand when the notch expands.
     #[must_use]
     #[allow(dead_code)] // Fase 1 T1.4
     pub fn new_with_sizes(sizes: &[u32]) -> Self {
-        let mut cache = HashMap::new();
-        let mut digit_advance_cache = HashMap::new();
+        let cache = HashMap::new();
+        let digit_advance_cache = HashMap::new();
         let mut has_loaded_font = false;
         let mut profile = FontInitProfile::default();
+        let mut font_data = None;
 
-        let mut font = None;
         for &path in &FONT_CANDIDATE_PATHS {
             let t_read_start = std::time::Instant::now();
             if let Ok(bytes) = std::fs::read(path) {
                 profile.read_file_us += t_read_start.elapsed().as_micros() as u64;
                 let t_parse_start = std::time::Instant::now();
-                if let Ok(f) = Font::from_bytes(bytes, FontSettings::default()) {
+                if ttf_parser::Face::parse(&bytes, 0).is_ok() {
                     profile.parse_font_us += t_parse_start.elapsed().as_micros() as u64;
-                    font = Some(f);
+                    font_data = Some(bytes);
                     break;
                 }
             }
         }
 
-        if let Some(font) = font {
-            has_loaded_font = true;
-            let chars = Self::required_chars();
+        let cache = RefCell::new(cache);
+        let digit_advance_cache = RefCell::new(digit_advance_cache);
 
-            let t_raster_start = std::time::Instant::now();
-            for &size in sizes {
-                let mut max_digit_adv = 0.0_f32;
-                for &ch in &chars {
-                    let (metrics, bitmap) = font.rasterize(ch, size as f32);
-                    let cached = CachedGlyph {
-                        width: metrics.width,
-                        height: metrics.height,
-                        x_offset: metrics.xmin,
-                        y_offset: metrics.ymin,
-                        advance_width: metrics.advance_width,
-                        bitmap,
-                    };
-                    if ch.is_ascii_digit() && cached.advance_width > max_digit_adv {
-                        max_digit_adv = cached.advance_width;
+        if let Some(ref data) = font_data {
+            if let Ok(face) = ttf_parser::Face::parse(data, 0) {
+                has_loaded_font = true;
+                let t_raster_start = std::time::Instant::now();
+
+                for &size in sizes {
+                    let mut max_digit_adv = 0.0_f32;
+                    let scale = size as f32 / face.units_per_em() as f32;
+
+                    for &ch in &STARTUP_GLYPH_CHARS {
+                        if let Some(cached) = rasterize_glyph_ttf(&face, ch, size) {
+                            if ch.is_ascii_digit() && cached.advance_width > max_digit_adv {
+                                max_digit_adv = cached.advance_width;
+                            }
+                            cache.borrow_mut().insert((ch, size), cached);
+                        }
                     }
-                    cache.insert((ch, size), cached);
+
+                    if max_digit_adv <= 0.0 {
+                        max_digit_adv = (face.units_per_em() as f32 * 0.6) * scale;
+                    }
+                    digit_advance_cache.borrow_mut().insert(size, max_digit_adv);
                 }
-                if max_digit_adv <= 0.0 {
-                    max_digit_adv = (size as f32) * 0.6;
-                }
-                digit_advance_cache.insert(size, max_digit_adv);
+
+                profile.rasterize_glyphs_us = t_raster_start.elapsed().as_micros() as u64;
+                profile.glyph_count = cache.borrow().len();
             }
-            profile.rasterize_glyphs_us = t_raster_start.elapsed().as_micros() as u64;
-            profile.glyph_count = cache.len();
-            // `font` is dropped here, reclaiming all parsed font tables and raw buffer memory!
         } else {
             #[cfg(debug_assertions)]
             eprintln!("[godnotch] No system font found; text rendering will be silent/disabled");
         }
 
         Self {
+            font_data,
             cache,
             digit_advance_cache,
             has_loaded_font,
@@ -137,11 +269,11 @@ impl FontRenderer {
         }
     }
 
-    /// Initializes with default sizes across common DPI scales (13px..80px).
+    /// Initializes with default closed clock sizes (13px, plus scale variations on startup).
     #[must_use]
     #[allow(dead_code)] // Fase 1 T1.4
     pub fn new() -> Self {
-        Self::new_with_sizes(&[13, 16, 20, 26, 40, 50, 60, 80])
+        Self::new_with_sizes(&[13])
     }
 
     /// Returns true if a system font was found and loaded.
@@ -151,22 +283,69 @@ impl FontRenderer {
         self.has_loaded_font
     }
 
-    /// Retrieves a pre-rasterized glyph from cache.
+    /// Returns the number of glyphs currently held in the bounded cache.
     #[must_use]
     #[allow(dead_code)] // Fase 1 T1.4
-    pub fn get_glyph(&self, ch: char, px_size: u32) -> Option<&CachedGlyph> {
-        self.cache.get(&(ch, px_size))
+    pub fn cache_len(&self) -> usize {
+        self.cache.borrow().len()
+    }
+
+    /// Retrieves an existing glyph from cache or lazily rasterizes it on demand.
+    #[must_use]
+    #[allow(dead_code)] // Fase 1 T1.4
+    pub fn get_glyph(&self, ch: char, px_size: u32) -> Option<CachedGlyph> {
+        if let Some(cached) = self.cache.borrow().get(&(ch, px_size)) {
+            return Some(cached.clone());
+        }
+
+        if let Some(ref data) = self.font_data
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+            && let Some(cached) = rasterize_glyph_ttf(&face, ch, px_size)
+        {
+            let mut cache = self.cache.borrow_mut();
+            if cache.len() >= MAX_GLYPH_CACHE_ENTRIES {
+                // Preserve clock digits while evicting excess lazy glyphs
+                cache.retain(|&(c, _), _| c.is_ascii_digit() || c == ':');
+                if cache.len() >= MAX_GLYPH_CACHE_ENTRIES {
+                    cache.clear();
+                }
+            }
+            cache.insert((ch, px_size), cached.clone());
+            return Some(cached);
+        }
+        None
     }
 
     /// Returns the maximum advance width for digits '0'..='9' at `px_size`.
     #[must_use]
     #[allow(dead_code)] // Fase 1 T1.4
     pub fn max_digit_advance(&self, px_size: u32) -> f32 {
-        if let Some(&adv) = self.digit_advance_cache.get(&px_size) {
-            adv
-        } else {
-            (px_size as f32) * 0.6
+        if let Some(&adv) = self.digit_advance_cache.borrow().get(&px_size) {
+            return adv;
         }
+
+        if let Some(ref data) = self.font_data
+            && let Ok(face) = ttf_parser::Face::parse(data, 0)
+        {
+            let scale = px_size as f32 / face.units_per_em() as f32;
+            let mut max_adv = 0.0_f32;
+            for d in '0'..='9' {
+                if let Some(id) = face.glyph_index(d) {
+                    let adv = face.glyph_hor_advance(id).unwrap_or(0) as f32 * scale;
+                    if adv > max_adv {
+                        max_adv = adv;
+                    }
+                }
+            }
+            if max_adv > 0.0 {
+                self.digit_advance_cache
+                    .borrow_mut()
+                    .insert(px_size, max_adv);
+                return max_adv;
+            }
+        }
+
+        (px_size as f32) * 0.6
     }
 
     /// Measures the total horizontal pixel width of `text` at `px_size`.
@@ -224,15 +403,16 @@ impl FontRenderer {
         let p_height = pixmap.height() as i32;
 
         for ch in text.chars() {
+            let maybe_glyph = self.get_glyph(ch, px_size);
             let cell_width = if tabular_digits && ch.is_ascii_digit() {
                 max_digit_adv
-            } else if let Some(g) = self.get_glyph(ch, px_size) {
+            } else if let Some(ref g) = maybe_glyph {
                 g.advance_width
             } else {
                 (px_size as f32) * 0.5
             };
 
-            if let Some(glyph) = self.get_glyph(ch, px_size) {
+            if let Some(glyph) = maybe_glyph {
                 let glyph_x = if tabular_digits && ch.is_ascii_digit() {
                     curr_x + (cell_width - glyph.advance_width) / 2.0 + glyph.x_offset as f32
                 } else {
@@ -302,6 +482,7 @@ impl Default for FontRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fontdue::{Font, FontSettings};
     use tiny_skia::Pixmap;
 
     #[test]
@@ -410,6 +591,7 @@ mod tests {
         if renderer.has_font() {
             let total_glyph_bytes: usize = renderer
                 .cache
+                .borrow()
                 .values()
                 .map(|g| g.bitmap.len() + std::mem::size_of::<CachedGlyph>())
                 .sum();
@@ -420,7 +602,7 @@ mod tests {
 
             println!(
                 "[B1 FONT_MEMORY] Pre-rasterized glyph cache entries: {}, total cache payload: {:.3} KB ({:.4} MB)",
-                renderer.cache.len(),
+                renderer.cache.borrow().len(),
                 (total_glyph_bytes as f64) / 1024.0,
                 glyph_mb
             );
@@ -437,5 +619,341 @@ mod tests {
                 glyph_mb
             );
         }
+    }
+
+    #[test]
+    fn test_glyphs_non_empty_and_bounded_across_scales() {
+        let renderer = FontRenderer::new();
+        if !renderer.has_font() {
+            println!("[SKIP] System font not found; skipping scale bounding test");
+            return;
+        }
+
+        let scales = [1.0_f32, 1.25, 1.5, 2.0];
+        let test_chars = ['0', '1', '9', ':', 'R', 'a', 'b', 'u', 'S', 'e', 'p'];
+
+        for &s in &scales {
+            let size_closed = (13.0 * s).round() as u32;
+            let size_open = (40.0 * s).round() as u32;
+
+            for &px_size in &[size_closed, size_open] {
+                for &ch in &test_chars {
+                    let glyph = renderer
+                        .get_glyph(ch, px_size)
+                        .unwrap_or_else(|| panic!("Glyph '{}' at size {} missing", ch, px_size));
+
+                    assert!(
+                        glyph.width > 0,
+                        "Glyph '{}' width 0 at size {}",
+                        ch,
+                        px_size
+                    );
+                    assert!(
+                        glyph.height > 0,
+                        "Glyph '{}' height 0 at size {}",
+                        ch,
+                        px_size
+                    );
+                    assert_eq!(glyph.bitmap.len(), glyph.width * glyph.height);
+                    assert!(
+                        glyph.bitmap.iter().any(|&c| c > 0),
+                        "Glyph '{}' at size {} has entirely empty bitmap",
+                        ch,
+                        px_size
+                    );
+                    assert!(
+                        glyph.width <= (px_size * 2) as usize,
+                        "Glyph '{}' width {} unreasonably large for size {}",
+                        ch,
+                        glyph.width,
+                        px_size
+                    );
+                    assert!(
+                        glyph.height <= (px_size * 2) as usize,
+                        "Glyph '{}' height {} unreasonably large for size {}",
+                        ch,
+                        glyph.height,
+                        px_size
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_quality_parity_fontdue_vs_ttf_skia() {
+        let renderer = FontRenderer::new();
+        if !renderer.has_font() {
+            println!("[SKIP] System font not found; skipping parity test");
+            return;
+        }
+
+        let font_bytes = renderer.font_data.as_ref().unwrap();
+        let fontdue_font = Font::from_bytes(font_bytes.as_slice(), FontSettings::default())
+            .expect("fontdue parse font");
+
+        let test_strings = [
+            ("12:45", 13u32),
+            ("12:45", 40u32),
+            ("Rabu, 30 September 2026", 13u32),
+            ("Rabu, 30 September 2026", 40u32),
+        ];
+
+        for (text, size) in test_strings {
+            let width = 600;
+            let height = 80;
+
+            // 1. Render with fontdue
+            let mut pm_fontdue = Pixmap::new(width, height).unwrap();
+            let mut x_fd = 10.0_f32;
+            let baseline_y = 50.0_f32;
+            for ch in text.chars() {
+                let (metrics, bitmap) = fontdue_font.rasterize(ch, size as f32);
+                let gx = (x_fd + metrics.xmin as f32).round() as i32;
+                let gy =
+                    (baseline_y - (metrics.ymin as f32 + metrics.height as f32)).round() as i32;
+                let data = pm_fontdue.data_mut();
+                for r in 0..metrics.height as i32 {
+                    let py = gy + r;
+                    if py < 0 || py >= height as i32 {
+                        continue;
+                    }
+                    for c in 0..metrics.width as i32 {
+                        let px = gx + c;
+                        if px < 0 || px >= width as i32 {
+                            continue;
+                        }
+                        let cov = bitmap[(r as usize) * metrics.width + (c as usize)];
+                        let idx = ((py * width as i32 + px) * 4) as usize;
+                        data[idx + 3] = data[idx + 3].max(cov);
+                    }
+                }
+                x_fd += metrics.advance_width;
+            }
+
+            // 2. Render with ttf-parser + tiny-skia
+            let mut pm_ttf = Pixmap::new(width, height).unwrap();
+            renderer.draw_text(
+                &mut pm_ttf.as_mut(),
+                text,
+                10.0,
+                baseline_y,
+                size,
+                (255, 255, 255),
+                1.0,
+                false,
+            );
+
+            // 3. Compute ink bounding boxes
+            let get_bbox = |pm: &Pixmap| -> Option<(i32, i32, i32, i32)> {
+                let mut min_x = width as i32;
+                let mut max_x = 0;
+                let mut min_y = height as i32;
+                let mut max_y = 0;
+                let mut has_ink = false;
+                for y in 0..height as i32 {
+                    for x in 0..width as i32 {
+                        let a = pm.data()[((y * width as i32 + x) * 4 + 3) as usize];
+                        if a > 10 {
+                            has_ink = true;
+                            min_x = min_x.min(x);
+                            max_x = max_x.max(x);
+                            min_y = min_y.min(y);
+                            max_y = max_y.max(y);
+                        }
+                    }
+                }
+                if has_ink {
+                    Some((min_x, min_y, max_x, max_y))
+                } else {
+                    None
+                }
+            };
+
+            let bbox_fd = get_bbox(&pm_fontdue).expect("fontdue has ink");
+            let bbox_ttf = get_bbox(&pm_ttf).expect("ttf has ink");
+
+            let dx_min = (bbox_fd.0 - bbox_ttf.0).abs();
+            let dy_min = (bbox_fd.1 - bbox_ttf.1).abs();
+            let dx_max = (bbox_fd.2 - bbox_ttf.2).abs();
+            let dy_max = (bbox_fd.3 - bbox_ttf.3).abs();
+
+            // 4. Compute average per-pixel coverage difference
+            let mut total_diff = 0.0_f64;
+            let mut ink_pixels = 0usize;
+            for idx in (3..pm_fontdue.data().len()).step_by(4) {
+                let a_fd = pm_fontdue.data()[idx] as f64 / 255.0;
+                let a_ttf = pm_ttf.data()[idx] as f64 / 255.0;
+                if a_fd > 0.0 || a_ttf > 0.0 {
+                    total_diff += (a_fd - a_ttf).abs();
+                    ink_pixels += 1;
+                }
+            }
+            let avg_diff = if ink_pixels > 0 {
+                total_diff / ink_pixels as f64
+            } else {
+                0.0
+            };
+
+            println!(
+                "[PARITY_METRICS] Text '{}' @ {}px | BBox FD: {:?} vs TTF: {:?} (delta: dx_min={}, dy_min={}, dx_max={}, dy_max={}) | Avg coverage diff: {:.4} ({:.2}%)",
+                text,
+                size,
+                bbox_fd,
+                bbox_ttf,
+                dx_min,
+                dy_min,
+                dx_max,
+                dy_max,
+                avg_diff,
+                avg_diff * 100.0
+            );
+
+            assert!(
+                dx_min <= 1,
+                "dx_min {} exceeded 1px bound for '{}' @ {}px",
+                dx_min,
+                text,
+                size
+            );
+            assert!(
+                dy_min <= 1,
+                "dy_min {} exceeded 1px bound for '{}' @ {}px",
+                dy_min,
+                text,
+                size
+            );
+            assert!(
+                dx_max <= 2,
+                "dx_max {} exceeded 2px bound for '{}' @ {}px",
+                dx_max,
+                text,
+                size
+            );
+            assert!(
+                dy_max <= 2,
+                "dy_max {} exceeded 2px bound for '{}' @ {}px",
+                dy_max,
+                text,
+                size
+            );
+            assert!(
+                avg_diff < 0.20,
+                "Coverage difference {:.4} exceeded 20% for '{}' @ {}px",
+                avg_diff,
+                text,
+                size
+            );
+        }
+    }
+
+    #[test]
+    fn test_glyph_cache_remains_bounded() {
+        let renderer = FontRenderer::new();
+        if !renderer.has_font() {
+            println!("[SKIP] System font not found; skipping cache bounding test");
+            return;
+        }
+
+        // Request 1000 unique unicode characters
+        for c in '\u{0100}'..='\u{04E8}' {
+            let _ = renderer.get_glyph(c, 16);
+        }
+
+        let count = renderer.cache_len();
+        println!(
+            "[CACHE_BOUNDED] Cache entry count after 1000 requests: {} (limit: {})",
+            count, MAX_GLYPH_CACHE_ENTRIES
+        );
+        assert!(
+            count <= MAX_GLYPH_CACHE_ENTRIES,
+            "Cache length {} exceeded maximum bound {}",
+            count,
+            MAX_GLYPH_CACHE_ENTRIES
+        );
+    }
+
+    #[test]
+    fn test_missing_font_fallback_graceful() {
+        let renderer = FontRenderer::new_empty();
+        assert!(
+            !renderer.has_font(),
+            "Empty renderer must report false for has_font"
+        );
+        let w = renderer.measure_text_width("Hello 12:34", 16, true);
+        assert!(w >= 0.0);
+
+        let mut pm = Pixmap::new(100, 30).unwrap();
+        renderer.draw_text(
+            &mut pm.as_mut(),
+            "Hello",
+            0.0,
+            20.0,
+            16,
+            (255, 255, 255),
+            1.0,
+            false,
+        );
+        assert!(
+            pm.data().iter().all(|&b| b == 0),
+            "Empty renderer must not write ink to pixmap"
+        );
+    }
+
+    #[test]
+    fn test_first_open_frame_render_cost() {
+        let renderer = FontRenderer::new();
+        if !renderer.has_font() {
+            println!("[SKIP] System font not found; skipping first open frame benchmark");
+            return;
+        }
+
+        let mut pixmap = Pixmap::new(400, 130).unwrap();
+        let geom = crate::core::layout::calculate_geometry_per_axis(1.0, 1.0, 1.0);
+        crate::core::renderer::render_notch(&mut pixmap.as_mut(), &geom);
+
+        // Measure first frame when open content is rendered for the first time
+        let t0 = std::time::Instant::now();
+
+        // 1. Draw large clock (40px)
+        renderer.draw_text(
+            &mut pixmap.as_mut(),
+            "12:45",
+            100.0,
+            48.0,
+            40,
+            (255, 255, 255),
+            1.0,
+            true,
+        );
+
+        // 2. Draw localized date (13px)
+        renderer.draw_text(
+            &mut pixmap.as_mut(),
+            "Rabu, 30 September 2026",
+            100.0,
+            74.0,
+            13,
+            (170, 170, 175),
+            1.0,
+            false,
+        );
+
+        let elapsed_us = t0.elapsed().as_micros() as u64;
+        let elapsed_ms = elapsed_us as f64 / 1000.0;
+
+        let budget_ms = if cfg!(debug_assertions) { 15.0 } else { 4.0 };
+
+        println!(
+            "[FIRST_OPEN_FRAME] Cost to lazily rasterize & render large clock (40px) + full date (13px): {:.3} ms (budget < {:.1} ms)",
+            elapsed_ms, budget_ms
+        );
+
+        assert!(
+            elapsed_ms < budget_ms,
+            "First open frame render took {:.3} ms, exceeding {:.1} ms budget",
+            elapsed_ms,
+            budget_ms
+        );
     }
 }

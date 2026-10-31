@@ -9,6 +9,7 @@ readme = "README.md"
 [dependencies]
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 fontdue = { version = "0.9", default-features = false }
+ttf-parser = { version = "0.25", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
