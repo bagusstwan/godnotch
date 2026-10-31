@@ -1,4 +1,4 @@
-//! Pure software text rendering and pre-rasterized glyph cache using fontdue.
+//! Pure software text rendering and pre-rasterized glyph cache using ttf-parser and tiny-skia.
 //!
 //! Loads a single system font (Segoe UI Semibold with fallbacks) to pre-rasterize
 //! only the required glyphs (digits, ':', date/time letters in ID/EN) at the active
@@ -482,7 +482,6 @@ impl Default for FontRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fontdue::{Font, FontSettings};
     use tiny_skia::Pixmap;
 
     #[test]
@@ -681,60 +680,28 @@ mod tests {
     }
 
     #[test]
-    fn test_quality_parity_fontdue_vs_ttf_skia() {
+    fn test_text_rasterization_quality_and_bounds() {
         let renderer = FontRenderer::new();
         if !renderer.has_font() {
-            println!("[SKIP] System font not found; skipping parity test");
+            println!("[SKIP] System font not found; skipping quality test");
             return;
         }
 
-        let font_bytes = renderer.font_data.as_ref().unwrap();
-        let fontdue_font = Font::from_bytes(font_bytes.as_slice(), FontSettings::default())
-            .expect("fontdue parse font");
-
-        let test_strings = [
-            ("12:45", 13u32),
-            ("12:45", 40u32),
-            ("Rabu, 30 September 2026", 13u32),
-            ("Rabu, 30 September 2026", 40u32),
+        let test_cases = [
+            ("12:45", 13u32, (10, 40, 39, 50)),
+            ("12:45", 40u32, (11, 21, 100, 50)),
+            ("Rabu, 30 September 2026", 13u32, (11, 40, 161, 52)),
+            ("Rabu, 30 September 2026", 40u32, (13, 20, 475, 59)),
         ];
 
-        for (text, size) in test_strings {
+        for (text, size, expected_bbox) in test_cases {
             let width = 600;
             let height = 80;
-
-            // 1. Render with fontdue
-            let mut pm_fontdue = Pixmap::new(width, height).unwrap();
-            let mut x_fd = 10.0_f32;
             let baseline_y = 50.0_f32;
-            for ch in text.chars() {
-                let (metrics, bitmap) = fontdue_font.rasterize(ch, size as f32);
-                let gx = (x_fd + metrics.xmin as f32).round() as i32;
-                let gy =
-                    (baseline_y - (metrics.ymin as f32 + metrics.height as f32)).round() as i32;
-                let data = pm_fontdue.data_mut();
-                for r in 0..metrics.height as i32 {
-                    let py = gy + r;
-                    if py < 0 || py >= height as i32 {
-                        continue;
-                    }
-                    for c in 0..metrics.width as i32 {
-                        let px = gx + c;
-                        if px < 0 || px >= width as i32 {
-                            continue;
-                        }
-                        let cov = bitmap[(r as usize) * metrics.width + (c as usize)];
-                        let idx = ((py * width as i32 + px) * 4) as usize;
-                        data[idx + 3] = data[idx + 3].max(cov);
-                    }
-                }
-                x_fd += metrics.advance_width;
-            }
 
-            // 2. Render with ttf-parser + tiny-skia
-            let mut pm_ttf = Pixmap::new(width, height).unwrap();
+            let mut pm = Pixmap::new(width, height).unwrap();
             renderer.draw_text(
-                &mut pm_ttf.as_mut(),
+                &mut pm.as_mut(),
                 text,
                 10.0,
                 baseline_y,
@@ -744,69 +711,45 @@ mod tests {
                 false,
             );
 
-            // 3. Compute ink bounding boxes
-            let get_bbox = |pm: &Pixmap| -> Option<(i32, i32, i32, i32)> {
-                let mut min_x = width as i32;
-                let mut max_x = 0;
-                let mut min_y = height as i32;
-                let mut max_y = 0;
-                let mut has_ink = false;
-                for y in 0..height as i32 {
-                    for x in 0..width as i32 {
-                        let a = pm.data()[((y * width as i32 + x) * 4 + 3) as usize];
-                        if a > 10 {
-                            has_ink = true;
-                            min_x = min_x.min(x);
-                            max_x = max_x.max(x);
-                            min_y = min_y.min(y);
-                            max_y = max_y.max(y);
-                        }
+            // Compute ink bounding box
+            let mut min_x = width as i32;
+            let mut max_x = 0;
+            let mut min_y = height as i32;
+            let mut max_y = 0;
+            let mut has_ink = false;
+            let mut antialiased_pixels = 0usize;
+
+            for y in 0..height as i32 {
+                for x in 0..width as i32 {
+                    let a = pm.data()[((y * width as i32 + x) * 4 + 3) as usize];
+                    if a > 10 {
+                        has_ink = true;
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                        min_y = min_y.min(y);
+                        max_y = max_y.max(y);
+                    }
+                    if a > 10 && a < 245 {
+                        antialiased_pixels += 1;
                     }
                 }
-                if has_ink {
-                    Some((min_x, min_y, max_x, max_y))
-                } else {
-                    None
-                }
-            };
-
-            let bbox_fd = get_bbox(&pm_fontdue).expect("fontdue has ink");
-            let bbox_ttf = get_bbox(&pm_ttf).expect("ttf has ink");
-
-            let dx_min = (bbox_fd.0 - bbox_ttf.0).abs();
-            let dy_min = (bbox_fd.1 - bbox_ttf.1).abs();
-            let dx_max = (bbox_fd.2 - bbox_ttf.2).abs();
-            let dy_max = (bbox_fd.3 - bbox_ttf.3).abs();
-
-            // 4. Compute average per-pixel coverage difference
-            let mut total_diff = 0.0_f64;
-            let mut ink_pixels = 0usize;
-            for idx in (3..pm_fontdue.data().len()).step_by(4) {
-                let a_fd = pm_fontdue.data()[idx] as f64 / 255.0;
-                let a_ttf = pm_ttf.data()[idx] as f64 / 255.0;
-                if a_fd > 0.0 || a_ttf > 0.0 {
-                    total_diff += (a_fd - a_ttf).abs();
-                    ink_pixels += 1;
-                }
             }
-            let avg_diff = if ink_pixels > 0 {
-                total_diff / ink_pixels as f64
-            } else {
-                0.0
-            };
+
+            assert!(
+                has_ink,
+                "Rendered text '{}' @ {}px produced no ink",
+                text, size
+            );
+            let bbox = (min_x, min_y, max_x, max_y);
+
+            let dx_min = (bbox.0 - expected_bbox.0).abs();
+            let dy_min = (bbox.1 - expected_bbox.1).abs();
+            let dx_max = (bbox.2 - expected_bbox.2).abs();
+            let dy_max = (bbox.3 - expected_bbox.3).abs();
 
             println!(
-                "[PARITY_METRICS] Text '{}' @ {}px | BBox FD: {:?} vs TTF: {:?} (delta: dx_min={}, dy_min={}, dx_max={}, dy_max={}) | Avg coverage diff: {:.4} ({:.2}%)",
-                text,
-                size,
-                bbox_fd,
-                bbox_ttf,
-                dx_min,
-                dy_min,
-                dx_max,
-                dy_max,
-                avg_diff,
-                avg_diff * 100.0
+                "[QUALITY_METRICS] Text '{}' @ {}px | BBox: {:?} vs Golden: {:?} (delta: dx_min={}, dy_min={}, dx_max={}, dy_max={}) | AA pixels: {}",
+                text, size, bbox, expected_bbox, dx_min, dy_min, dx_max, dy_max, antialiased_pixels
             );
 
             assert!(
@@ -824,23 +767,22 @@ mod tests {
                 size
             );
             assert!(
-                dx_max <= 2,
-                "dx_max {} exceeded 2px bound for '{}' @ {}px",
+                dx_max <= 1,
+                "dx_max {} exceeded 1px bound for '{}' @ {}px",
                 dx_max,
                 text,
                 size
             );
             assert!(
-                dy_max <= 2,
-                "dy_max {} exceeded 2px bound for '{}' @ {}px",
+                dy_max <= 1,
+                "dy_max {} exceeded 1px bound for '{}' @ {}px",
                 dy_max,
                 text,
                 size
             );
             assert!(
-                avg_diff < 0.20,
-                "Coverage difference {:.4} exceeded 20% for '{}' @ {}px",
-                avg_diff,
+                antialiased_pixels > 0,
+                "Expected anti-aliased edge pixels for '{}' @ {}px",
                 text,
                 size
             );

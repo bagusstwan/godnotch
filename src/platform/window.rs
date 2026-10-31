@@ -581,7 +581,7 @@ impl StartupProfile {
     #[allow(dead_code)]
     pub fn print(&self) {
         println!(
-            "\n[STARTUP_PROFILE] Initial launch breakdown (main -> UpdateLayeredWindow presented):\n  1. Win32 Window & DC Creation   : {:7.3} ms\n  2. Font File Read               : {:7.3} ms\n  3. Font Parsing (fontdue)       : {:7.3} ms\n  4. Pre-rasterization ({} glifs): {:7.3} ms\n  5. Initial Buffer Rasterize     : {:7.3} ms\n  6. Initial UpdateLayeredWindow  : {:7.3} ms\n  ------------------------------------------------\n  TOTAL time to first pixel       : {:7.3} ms",
+            "\n[STARTUP_PROFILE] Initial launch breakdown (main -> UpdateLayeredWindow presented):\n  1. Win32 Window & DC Creation   : {:7.3} ms\n  2. Font File Read               : {:7.3} ms\n  3. Font Parsing (ttf-parser)   : {:7.3} ms\n  4. Pre-rasterization ({} glifs): {:7.3} ms\n  5. Initial Buffer Rasterize     : {:7.3} ms\n  6. Initial UpdateLayeredWindow  : {:7.3} ms\n  ------------------------------------------------\n  TOTAL time to first pixel       : {:7.3} ms",
             self.window_create_us as f64 / 1000.0,
             self.font_init.read_file_us as f64 / 1000.0,
             self.font_init.parse_font_us as f64 / 1000.0,
