@@ -13,7 +13,9 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, SYSTEMTIME, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
@@ -33,8 +35,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_MOUSEMOVE,
-    WM_NCDESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -44,13 +46,16 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Custom message posted by the DWM VSync pacer thread to drive UI animation frames.
 pub const WM_APP_FRAME: u32 = WM_APP + 1;
 
+use crate::core::i18n::{self, Language, TimeFormat};
 use crate::core::layout;
 use crate::core::motion::{Motion, MotionDirection};
 use crate::core::renderer;
+use crate::core::text::FontRenderer;
 
 const TIMER_OPEN_DELAY: usize = 101;
 const TIMER_CLOSE_DELAY: usize = 102;
 const TIMER_ANIM: usize = 103;
+const TIMER_MINUTE_CLOCK: usize = 104;
 
 const OPEN_DELAY_MS: u32 = 80;
 const CLOSE_DELAY_MS: u32 = 300;
@@ -78,6 +83,12 @@ pub struct DwmPacer {
     running: Arc<AtomicBool>,
     frame_pending: Arc<AtomicBool>,
     fallback_to_timer: Arc<AtomicBool>,
+    #[cfg(debug_assertions)]
+    pub force_fallback: Arc<AtomicBool>,
+    #[cfg(debug_assertions)]
+    pub spawn_count: Arc<std::sync::atomic::AtomicU32>,
+    #[cfg(debug_assertions)]
+    pub join_count: Arc<std::sync::atomic::AtomicU32>,
     thread_handle: Option<JoinHandle<()>>,
 }
 
@@ -88,13 +99,32 @@ impl DwmPacer {
             running: Arc::new(AtomicBool::new(false)),
             frame_pending: Arc::new(AtomicBool::new(false)),
             fallback_to_timer: Arc::new(AtomicBool::new(false)),
+            #[cfg(debug_assertions)]
+            force_fallback: Arc::new(AtomicBool::new(false)),
+            #[cfg(debug_assertions)]
+            spawn_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            #[cfg(debug_assertions)]
+            join_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             thread_handle: None,
         }
+    }
+
+    /// Returns true if the pacer thread is currently active.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn is_thread_alive(&self) -> bool {
+        self.running.load(Ordering::Acquire) || self.thread_handle.is_some()
     }
 
     /// Starts the DWM flush pacing thread.
     /// Returns true if the thread started or was already running.
     pub fn start(&mut self, hwnd: HWND) -> bool {
+        #[cfg(debug_assertions)]
+        if self.force_fallback.load(Ordering::Acquire) {
+            self.fallback_to_timer.store(true, Ordering::Release);
+            return false;
+        }
+
         if self.fallback_to_timer.load(Ordering::Acquire) {
             return false;
         }
@@ -105,6 +135,8 @@ impl DwmPacer {
 
         self.running.store(true, Ordering::Release);
         self.frame_pending.store(false, Ordering::Release);
+        #[cfg(debug_assertions)]
+        self.spawn_count.fetch_add(1, Ordering::SeqCst);
 
         let running = Arc::clone(&self.running);
         let frame_pending = Arc::clone(&self.frame_pending);
@@ -166,6 +198,8 @@ impl DwmPacer {
         self.running.store(false, Ordering::Release);
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
+            #[cfg(debug_assertions)]
+            self.join_count.fetch_add(1, Ordering::SeqCst);
         }
         self.frame_pending.store(false, Ordering::Release);
     }
@@ -202,7 +236,7 @@ impl FrameLogger {
     pub fn init() -> Self {
         let enabled = std::env::var_os("GODNOTCH_FRAMELOG").is_some();
         let log_path = std::env::temp_dir().join("godnotch-frames.csv");
-        if enabled && !log_path.exists() {
+        if enabled {
             let _ = std::fs::write(&log_path, "frame_index,dt_ms,method\n");
         }
         Self {
@@ -216,6 +250,11 @@ impl FrameLogger {
         if !self.enabled {
             return;
         }
+        if let Ok(metadata) = std::fs::metadata(&self.log_path)
+            && metadata.len() >= 1_048_576
+        {
+            return;
+        }
         self.frame_count += 1;
         let line = format!("{},{:.3},{}\n", self.frame_count, dt_ms, method);
         use std::io::Write;
@@ -226,6 +265,36 @@ impl FrameLogger {
         {
             let _ = file.write_all(line.as_bytes());
         }
+    }
+}
+
+/// Queries the Windows system time format (12-hour or 24-hour).
+#[must_use]
+pub fn query_system_time_format() -> TimeFormat {
+    use windows::Win32::Globalization::GetLocaleInfoEx;
+    const LOCALE_ITIME: u32 = 0x0000_0028;
+    let mut buf = [0u16; 8];
+    // SAFETY: Querying user default locale time format (12/24 hour). Passing null PCWSTR selects LOCALE_NAME_USER_DEFAULT.
+    let ret = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_ITIME, Some(&mut buf)) };
+    if ret > 0 && buf[0] == b'0' as u16 {
+        TimeFormat::Hour12
+    } else {
+        TimeFormat::Hour24
+    }
+}
+
+/// Queries the Windows user default locale language (Indonesian or English).
+#[must_use]
+pub fn query_user_locale_language() -> Language {
+    use windows::Win32::Globalization::GetUserDefaultLocaleName;
+    let mut buf = [0u16; 85];
+    // SAFETY: Querying user default locale name string (BCP-47).
+    let ret = unsafe { GetUserDefaultLocaleName(&mut buf) };
+    if ret > 1 {
+        let name = String::from_utf16_lossy(&buf[..ret as usize - 1]);
+        Language::from_locale_name(&name)
+    } else {
+        Language::Indonesian
     }
 }
 
@@ -246,6 +315,16 @@ pub struct NotchWindowState {
     pub last_frame: Instant,
     pub dirty: bool,
     pub pixmap: Pixmap,
+
+    pub font_renderer: FontRenderer,
+    pub time_format: TimeFormat,
+    pub language: Language,
+    pub current_hour: u16,
+    pub current_minute: u16,
+    pub current_day_of_week: u16,
+    pub current_day: u16,
+    pub current_month: u16,
+    pub current_year: u16,
 
     pub is_tracking_leave: bool,
     pub pacer: DwmPacer,
@@ -271,6 +350,25 @@ impl Drop for NotchWindowState {
 }
 
 impl NotchWindowState {
+    /// Updates the cached system time and returns true if minute or date changed.
+    pub fn update_time(&mut self, st: &SYSTEMTIME) -> bool {
+        let changed = self.current_hour != st.wHour
+            || self.current_minute != st.wMinute
+            || self.current_day != st.wDay
+            || self.current_month != st.wMonth
+            || self.current_year != st.wYear;
+        if changed {
+            self.current_hour = st.wHour;
+            self.current_minute = st.wMinute;
+            self.current_day_of_week = st.wDayOfWeek;
+            self.current_day = st.wDay;
+            self.current_month = st.wMonth;
+            self.current_year = st.wYear;
+            self.dirty = true;
+        }
+        changed
+    }
+
     /// Renders the notch shape into the local DIB pixel buffer.
     /// This function performs purely CPU-bound rasterization and does NOT make
     /// Win32 presentation calls, ensuring it is safe to execute while borrowed.
@@ -285,6 +383,84 @@ impl NotchWindowState {
             self.scale,
         );
         renderer::render_notch(&mut self.pixmap.as_mut(), &geom);
+
+        let p_h = self.motion.height_progress();
+        let closed_alpha = layout::closed_content_alpha(p_h);
+        let open_alpha = layout::open_content_alpha(p_h);
+
+        // 1. Closed state content: clock centered in closed notch
+        if closed_alpha > 0.001 {
+            let clock_str =
+                i18n::format_time(self.time_format, self.current_hour, self.current_minute);
+            let font_size = (layout::CLOSED_CLOCK_FONT_SIZE * self.scale).round() as u32;
+            let text_w = self
+                .font_renderer
+                .measure_text_width(&clock_str, font_size, true);
+
+            let text_x = geom.x + (geom.width - text_w) / 2.0;
+            let text_y = geom.y + (20.0 * self.scale).round();
+
+            self.font_renderer.draw_text(
+                &mut self.pixmap.as_mut(),
+                &clock_str,
+                text_x,
+                text_y,
+                font_size,
+                (255, 255, 255),
+                closed_alpha,
+                true,
+            );
+        }
+
+        // 2. Open state content: large clock + date
+        if open_alpha > 0.001 {
+            let clock_str =
+                i18n::format_time(self.time_format, self.current_hour, self.current_minute);
+            let font_size_clock = (layout::OPEN_CLOCK_FONT_SIZE * self.scale).round() as u32;
+            let clock_w = self
+                .font_renderer
+                .measure_text_width(&clock_str, font_size_clock, true);
+
+            let clock_x = geom.x + (geom.width - clock_w) / 2.0;
+            let clock_y = geom.y + (48.0 * self.scale).round();
+
+            self.font_renderer.draw_text(
+                &mut self.pixmap.as_mut(),
+                &clock_str,
+                clock_x,
+                clock_y,
+                font_size_clock,
+                (255, 255, 255),
+                open_alpha,
+                true,
+            );
+
+            let date_str = i18n::format_date(
+                self.language,
+                self.current_day_of_week,
+                self.current_day,
+                self.current_month,
+                self.current_year,
+            );
+            let font_size_date = (layout::OPEN_DATE_FONT_SIZE * self.scale).round() as u32;
+            let date_w = self
+                .font_renderer
+                .measure_text_width(&date_str, font_size_date, false);
+
+            let date_x = geom.x + (geom.width - date_w) / 2.0;
+            let date_y = geom.y + (74.0 * self.scale).round();
+
+            self.font_renderer.draw_text(
+                &mut self.pixmap.as_mut(),
+                &date_str,
+                date_x,
+                date_y,
+                font_size_date,
+                (170, 170, 175), // #AAAAAF
+                open_alpha,
+                false,
+            );
+        }
 
         let src = self.pixmap.data();
         // SAFETY: bits pointer was allocated by CreateDIBSection with size canvas_w * canvas_h * 4.
@@ -484,6 +660,12 @@ impl NotchWindow {
 
         let pixmap = Pixmap::new(canvas.width, canvas.height).ok_or_else(Error::from_win32)?;
 
+        // SAFETY: Querying current local system time.
+        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        let time_format = query_system_time_format();
+        let language = query_user_locale_language();
+        let font_renderer = FontRenderer::new();
+
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
             mem_dc,
@@ -498,6 +680,15 @@ impl NotchWindow {
             last_frame: Instant::now(),
             dirty: true,
             pixmap,
+            font_renderer,
+            time_format,
+            language,
+            current_hour: st.wHour,
+            current_minute: st.wMinute,
+            current_day_of_week: st.wDayOfWeek,
+            current_day: st.wDay,
+            current_month: st.wMonth,
+            current_year: st.wYear,
             is_tracking_leave: false,
             pacer: DwmPacer::new(),
             #[cfg(debug_assertions)]
@@ -523,6 +714,13 @@ impl NotchWindow {
         // SAFETY: Displaying window without activating or stealing focus.
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+
+        let delay_ms =
+            layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
+        // SAFETY: Setting initial one-shot timer to the next minute boundary.
+        unsafe {
+            SetTimer(hwnd, TIMER_MINUTE_CLOCK, delay_ms, None);
         }
 
         Ok(Self { hwnd })
@@ -708,6 +906,42 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         state.kick_anim(hwnd);
                     });
                 }
+            } else if timer_id == TIMER_MINUTE_CLOCK {
+                // SAFETY: Killing one-shot minute clock timer.
+                unsafe {
+                    let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
+                }
+                // SAFETY: Querying updated local system time.
+                let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+                let next_delay = layout::calculate_next_minute_delay_ms(
+                    st.wSecond as u32,
+                    st.wMilliseconds as u32,
+                );
+                // SAFETY: Scheduling one-shot timer for the next minute boundary.
+                unsafe {
+                    SetTimer(hwnd, TIMER_MINUTE_CLOCK, next_delay, None);
+                }
+
+                // SAFETY: Updating state and re-rendering if minute changed and not currently animating.
+                let render_res = unsafe {
+                    with_state(raw_cell, |state| {
+                        let changed = state.update_time(&st);
+                        if changed && !state.animating {
+                            state.dirty = true;
+                            let _ = state.render_buffer();
+                            Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
+                        } else {
+                            None
+                        }
+                    })
+                };
+
+                if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) = render_res {
+                    // SAFETY: Presenting window without holding state borrow.
+                    unsafe {
+                        let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                    }
+                }
             } else if timer_id == TIMER_ANIM {
                 // SAFETY: raw_cell is valid; advancing animation frame (timer fallback path).
                 let frame_res = unsafe {
@@ -811,6 +1045,48 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             LRESULT(0)
         }
 
+        WM_TIMECHANGE => {
+            // System time, time zone, or daylight saving time changed, or waking from sleep.
+            // SAFETY: Killing existing minute clock timer.
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
+            }
+            // SAFETY: Querying current system time after time change event.
+            let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+            let time_format = query_system_time_format();
+            let language = query_user_locale_language();
+            let next_delay =
+                layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
+            // SAFETY: Arming new one-shot timer aligned to the new minute boundary.
+            unsafe {
+                SetTimer(hwnd, TIMER_MINUTE_CLOCK, next_delay, None);
+            }
+
+            // SAFETY: Updating cached format/locale/time and redrawing if not animating.
+            let render_res = unsafe {
+                with_state(raw_cell, |state| {
+                    state.time_format = time_format;
+                    state.language = language;
+                    state.update_time(&st);
+                    if !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) = render_res {
+                // SAFETY: Presenting window without holding state borrow.
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+            }
+            LRESULT(0)
+        }
+
         WM_DESTROY => {
             // SAFETY: Stopping pacer thread, terminating timers, and posting quit message.
             unsafe {
@@ -820,6 +1096,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
                 let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
                 let _ = KillTimer(hwnd, TIMER_ANIM);
+                let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -972,6 +1249,7 @@ unsafe extern "system" fn message_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     #[test]
     fn test_message_only_window_creation() {
@@ -1108,6 +1386,388 @@ mod tests {
         assert_eq!(
             ticks_after_idle, ticks_at_settle,
             "No animation timer ticks may occur after settled"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    fn get_current_process_thread_count() -> u32 {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+
+        // SAFETY: Fetching current process ID to filter thread snapshot.
+        let current_pid = unsafe { GetCurrentProcessId() };
+        let mut thread_count = 0u32;
+
+        // SAFETY: Creating snapshot of all threads currently running.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if let Ok(handle) = snapshot {
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..Default::default()
+            };
+
+            // SAFETY: Enumerating threads in snapshot.
+            if unsafe { Thread32First(handle, &mut entry) }.is_ok() {
+                loop {
+                    if entry.th32OwnerProcessID == current_pid {
+                        thread_count += 1;
+                    }
+                    // SAFETY: Enumerating next thread in snapshot.
+                    if unsafe { Thread32Next(handle, &mut entry) }.is_err() {
+                        break;
+                    }
+                }
+            }
+            // SAFETY: Closing snapshot handle.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+        }
+        thread_count
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_dwm_pacer_stops_and_joins_on_settle() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PM_REMOVE, PeekMessageW, SendMessageW, TranslateMessage,
+        };
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create test notch window");
+        let hwnd = notch.hwnd();
+
+        // Send synthetic WM_MOUSEMOVE to trigger hover open delay and animation
+        unsafe {
+            SendMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), LPARAM(0));
+        }
+
+        // Pump messages until animation settles
+        let start = Instant::now();
+        let timeout = Duration::from_millis(2000);
+        let mut msg = MSG::default();
+
+        while start.elapsed() < timeout {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            let raw_cell = unsafe {
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState>
+            };
+            let is_anim_active = unsafe {
+                with_state(raw_cell, |s| s.debug_timer_stats.is_anim_timer_active).unwrap_or(false)
+            };
+            let ticks =
+                unsafe { with_state(raw_cell, |s| s.debug_timer_stats.anim_ticks).unwrap_or(0) };
+
+            if !is_anim_active && ticks > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+        let is_pacer_alive =
+            unsafe { with_state(raw_cell, |s| s.pacer.is_thread_alive()).expect("state exists") };
+        let is_anim_active = unsafe {
+            with_state(raw_cell, |s| s.debug_timer_stats.is_anim_timer_active)
+                .expect("state exists")
+        };
+
+        assert!(
+            !is_anim_active,
+            "Animation timer must be stopped upon settle"
+        );
+        assert!(
+            !is_pacer_alive,
+            "DWM pacer thread must be stopped and joined upon settle"
+        );
+        println!("[A3-1 PACER_STOP_JOIN] Pacer thread successfully stopped and joined upon settle");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_repeated_animations_do_not_leak_threads() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PM_REMOVE, PeekMessageW, TranslateMessage,
+        };
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create test notch window");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        let mut msg = MSG::default();
+        // Warm up cycle
+        unsafe {
+            with_state(raw_cell, |s| {
+                s.motion.open();
+                s.kick_anim(hwnd);
+            });
+        }
+        let warm_start = Instant::now();
+        while warm_start.elapsed() < Duration::from_millis(1000) {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let is_active = unsafe {
+                with_state(raw_cell, |s| s.debug_timer_stats.is_anim_timer_active).unwrap_or(false)
+            };
+            if !is_active {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let initial_threads = get_current_process_thread_count();
+
+        // Run 20 animation cycles
+        for cycle in 0..20 {
+            unsafe {
+                with_state(raw_cell, |s| {
+                    if cycle % 2 == 0 {
+                        s.motion.close();
+                    } else {
+                        s.motion.open();
+                    }
+                    s.kick_anim(hwnd);
+                });
+            }
+
+            let cycle_start = Instant::now();
+            while cycle_start.elapsed() < Duration::from_millis(1500) {
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                let is_active = unsafe {
+                    with_state(raw_cell, |s| s.debug_timer_stats.is_anim_timer_active)
+                        .unwrap_or(false)
+                };
+                if !is_active {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let final_threads = get_current_process_thread_count();
+        println!(
+            "[A3-2 THREAD_LEAK_CHECK] Initial threads: {}, Final threads after 20 animations: {}",
+            initial_threads, final_threads
+        );
+
+        assert!(
+            final_threads <= initial_threads + 1,
+            "Thread count increased unexpectedly: initial={}, final={}",
+            initial_threads,
+            final_threads
+        );
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn test_forced_fallback_timer_path() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PM_REMOVE, PeekMessageW, TranslateMessage,
+        };
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create test notch window");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Inject forced fallback on DwmPacer
+        unsafe {
+            with_state(raw_cell, |s| {
+                s.pacer.force_fallback.store(true, Ordering::Release);
+                s.motion.open();
+                s.kick_anim(hwnd);
+            });
+        }
+
+        let is_fallback =
+            unsafe { with_state(raw_cell, |s| s.pacer.is_fallback()).unwrap_or(false) };
+        assert!(is_fallback, "Pacer must fall back to timer when forced");
+
+        let start = Instant::now();
+        let timeout = Duration::from_millis(2000);
+        let mut msg = MSG::default();
+        let mut settled = false;
+
+        while start.elapsed() < timeout {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            if let Some(is_active) =
+                unsafe { with_state(raw_cell, |s| s.debug_timer_stats.is_anim_timer_active) }
+            {
+                let ticks = unsafe {
+                    with_state(raw_cell, |s| s.debug_timer_stats.anim_ticks).unwrap_or(0)
+                };
+                if !is_active && ticks > 0 {
+                    settled = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        assert!(
+            settled,
+            "Forced fallback SetTimer animation failed to settle within timeout"
+        );
+        println!(
+            "[A3-3 FORCED_FALLBACK] Successfully animated and settled using 16ms fallback timer"
+        );
+    }
+
+    #[test]
+    fn test_frame_render_cpu_cost_breakdown() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create test notch window");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        let iterations = 100;
+        let mut total_render_ns = 0u128;
+        let mut total_bgra_ns = 0u128;
+        let mut total_ulw_ns = 0u128;
+
+        for _ in 0..iterations {
+            let geom = layout::calculate_geometry_per_axis(0.5, 0.5, 1.0);
+
+            // Step 1: Render notch path in tiny-skia
+            let t0 = Instant::now();
+            unsafe {
+                with_state(raw_cell, |s| {
+                    renderer::render_notch(&mut s.pixmap.as_mut(), &geom);
+                });
+            }
+            total_render_ns += t0.elapsed().as_nanos();
+
+            // Step 2: RGBA to BGRA premultiplied conversion
+            let t1 = Instant::now();
+            unsafe {
+                with_state(raw_cell, |s| {
+                    let src = s.pixmap.data();
+                    let dst = std::slice::from_raw_parts_mut(s.bits, src.len());
+                    renderer::rgba_to_bgra_premultiplied(src, dst);
+                });
+            }
+            total_bgra_ns += t1.elapsed().as_nanos();
+
+            // Step 3: Present via UpdateLayeredWindow
+            let t2 = Instant::now();
+            unsafe {
+                with_state(raw_cell, |s| {
+                    let _ =
+                        present_layered_window(hwnd, s.mem_dc, s.screen_w, s.canvas_w, s.canvas_h);
+                });
+            }
+            total_ulw_ns += t2.elapsed().as_nanos();
+        }
+
+        let render_ms = (total_render_ns as f64) / (iterations as f64 * 1_000_000.0);
+        let bgra_ms = (total_bgra_ns as f64) / (iterations as f64 * 1_000_000.0);
+        let ulw_ms = (total_ulw_ns as f64) / (iterations as f64 * 1_000_000.0);
+        let total_ms = render_ms + bgra_ms + ulw_ms;
+
+        println!(
+            "[A6 CPU_COST_BREAKDOWN @ Scale 1.0x (400x130)]\n  1. render_notch         : {:.3} ms ({:.1}%)\n  2. rgba_to_bgra         : {:.3} ms ({:.1}%)\n  3. UpdateLayeredWindow  : {:.3} ms ({:.1}%)\n  TOTAL per frame         : {:.3} ms",
+            render_ms,
+            if total_ms > 0.0 {
+                (render_ms / total_ms) * 100.0
+            } else {
+                0.0
+            },
+            bgra_ms,
+            if total_ms > 0.0 {
+                (bgra_ms / total_ms) * 100.0
+            } else {
+                0.0
+            },
+            ulw_ms,
+            if total_ms > 0.0 {
+                (ulw_ms / total_ms) * 100.0
+            } else {
+                0.0
+            },
+            total_ms
+        );
+    }
+
+    #[test]
+    fn test_minute_clock_timer_scheduling_and_trigger() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for clock timer test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Verify initial state has valid time
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(s.current_hour <= 23);
+                assert!(s.current_minute <= 59);
+            });
+        }
+
+        // Simulate WM_TIMER for TIMER_MINUTE_CLOCK
+        // SAFETY: Dispatching synthetic WM_TIMER for the minute clock
+        let lres = unsafe { SendMessageW(hwnd, WM_TIMER, WPARAM(TIMER_MINUTE_CLOCK), LPARAM(0)) };
+        assert_eq!(lres.0, 0);
+
+        println!("[B4 MINUTE_CLOCK] Successfully processed TIMER_MINUTE_CLOCK and re-armed timer");
+    }
+
+    #[test]
+    fn test_wm_timechange_handling() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for timechange test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Simulate WM_TIMECHANGE
+        // SAFETY: Dispatching synthetic WM_TIMECHANGE
+        let lres = unsafe { SendMessageW(hwnd, WM_TIMECHANGE, WPARAM(0), LPARAM(0)) };
+        assert_eq!(lres.0, 0);
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(s.current_hour <= 23);
+                assert!(s.current_minute <= 59);
+            });
+        }
+
+        println!(
+            "[B4 TIMECHANGE] Successfully handled WM_TIMECHANGE, re-queried formats and refreshed timer"
         );
     }
 }

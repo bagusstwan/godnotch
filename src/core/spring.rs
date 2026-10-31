@@ -252,30 +252,60 @@ mod tests {
 
         let (p30, v30) = run_sim(&steps_30);
         let (p60, v60) = run_sim(&steps_60);
-        let (p144, _v144) = run_sim(&steps_144);
-        let (p240, _v240) = run_sim(&steps_240);
+        let (p144, v144) = run_sim(&steps_144);
+        let (p240, v240) = run_sim(&steps_240);
         let (pjitter, vjitter) = run_sim(&jitter);
 
+        let dev_30_60 = (p30 - p60).abs();
+        let dev_60_144 = (p60 - p144).abs();
+        let dev_144_240 = (p144 - p240).abs();
+        let dev_60_jitter = (p60 - pjitter).abs();
+        let max_pos_dev = dev_30_60
+            .max(dev_60_144)
+            .max(dev_144_240)
+            .max(dev_60_jitter);
+
+        println!(
+            "[A2-c FRAMERATE_INDEPENDENCE] Numeric type: f32 | Max position deviation: {:.6e} (tolerance: 1e-4)",
+            max_pos_dev
+        );
+        println!(
+            "  p30: {:.7}, p60: {:.7}, p144: {:.7}, p240: {:.7}, pjitter: {:.7}",
+            p30, p60, p144, p240, pjitter
+        );
+        println!(
+            "  dev(30,60): {:.3e}, dev(60,144): {:.3e}, dev(144,240): {:.3e}, dev(60,jitter): {:.3e}",
+            dev_30_60, dev_60_144, dev_144_240, dev_60_jitter
+        );
+
         assert!(
-            (p30 - p60).abs() < 1e-4,
+            dev_30_60 < 1e-4,
             "30fps vs 60fps pos error too large: {p30} vs {p60}"
         );
         assert!(
-            (p60 - p144).abs() < 1e-4,
+            dev_60_144 < 1e-4,
             "60fps vs 144fps pos error too large: {p60} vs {p144}"
         );
         assert!(
-            (p144 - p240).abs() < 1e-4,
+            dev_144_240 < 1e-4,
             "144fps vs 240fps pos error too large: {p144} vs {p240}"
         );
         assert!(
-            (p60 - pjitter).abs() < 1e-4,
+            dev_60_jitter < 1e-4,
             "60fps vs jitter pos error too large: {p60} vs {pjitter}"
         );
 
         assert!(
             (v30 - v60).abs() < 1e-4,
             "30fps vs 60fps vel error too large"
+        );
+        assert!(
+            (v60 - v144).abs() < 1e-4,
+            "60fps vs 144fps vel error too large"
+        );
+        assert!(
+            (v144 - v240).abs() < 1e-4,
+            "144fps vs 240fps vel error too large"
         );
         assert!(
             (v60 - vjitter).abs() < 1e-4,
@@ -329,6 +359,17 @@ mod tests {
 
             let rel_error =
                 ((measured_overshoot - theoretical_overshoot) / theoretical_overshoot).abs();
+
+            println!(
+                "[A2-b OVERSHOOT] zeta={:.2}: theoretical={:.4} ({:.2}%), measured={:.4} ({:.2}%), relative error={:.6}",
+                zeta,
+                theoretical_overshoot,
+                theoretical_overshoot * 100.0,
+                measured_overshoot,
+                measured_overshoot * 100.0,
+                rel_error
+            );
+
             assert!(
                 rel_error < 0.005,
                 "Overshoot for zeta={zeta} deviated from theory: measured={measured_overshoot}, theory={theoretical_overshoot}, rel_err={rel_error}"
