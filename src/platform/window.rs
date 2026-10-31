@@ -7,10 +7,14 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use tiny_skia::Pixmap;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP,
@@ -25,16 +29,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetSystemMetrics,
     GetWindowLongPtrW, HWND_MESSAGE, IDC_ARROW, KillTimer, LoadCursorW, MF_STRING, MSG,
-    PostQuitMessage, RegisterClassW, SM_CXSCREEN, SW_SHOWNOACTIVATE, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_MOUSEMOVE, WM_NCDESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SW_SHOWNOACTIVATE,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_MOUSEMOVE,
+    WM_NCDESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
 /// Win32 window message sent when the mouse leaves the client area of a window (0x02A3).
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// Custom message posted by the DWM VSync pacer thread to drive UI animation frames.
+pub const WM_APP_FRAME: u32 = WM_APP + 1;
 
 use crate::core::layout;
 use crate::core::motion::{Motion, MotionDirection};
@@ -65,6 +73,162 @@ pub struct DebugTimerStats {
     pub is_anim_timer_active: bool,
 }
 
+/// DWM-synced frame pacing manager.
+pub struct DwmPacer {
+    running: Arc<AtomicBool>,
+    frame_pending: Arc<AtomicBool>,
+    fallback_to_timer: Arc<AtomicBool>,
+    thread_handle: Option<JoinHandle<()>>,
+}
+
+impl DwmPacer {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            running: Arc::new(AtomicBool::new(false)),
+            frame_pending: Arc::new(AtomicBool::new(false)),
+            fallback_to_timer: Arc::new(AtomicBool::new(false)),
+            thread_handle: None,
+        }
+    }
+
+    /// Starts the DWM flush pacing thread.
+    /// Returns true if the thread started or was already running.
+    pub fn start(&mut self, hwnd: HWND) -> bool {
+        if self.fallback_to_timer.load(Ordering::Acquire) {
+            return false;
+        }
+
+        if self.running.load(Ordering::Acquire) && self.thread_handle.is_some() {
+            return true;
+        }
+
+        self.running.store(true, Ordering::Release);
+        self.frame_pending.store(false, Ordering::Release);
+
+        let running = Arc::clone(&self.running);
+        let frame_pending = Arc::clone(&self.frame_pending);
+        let fallback = Arc::clone(&self.fallback_to_timer);
+        // SAFETY: HWND handle value converted to integer isize for safe thread transfer.
+        let hwnd_isize = hwnd.0 as isize;
+
+        let handle = std::thread::Builder::new()
+            .name("godnotch-dwm-pacer".to_string())
+            .spawn(move || {
+                // Test DwmFlush once to verify desktop composition is available
+                // SAFETY: DwmFlush blocks until the next VSync interval.
+                if unsafe { DwmFlush().is_err() } {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[godnotch] DwmFlush unavailable, falling back to SetTimer 16ms");
+                    fallback.store(true, Ordering::Release);
+                    running.store(false, Ordering::Release);
+                    return;
+                }
+
+                while running.load(Ordering::Acquire) {
+                    // SAFETY: DwmFlush blocks until the next VSync interval.
+                    let hr = unsafe { DwmFlush() };
+                    if hr.is_err() {
+                        fallback.store(true, Ordering::Release);
+                        break;
+                    }
+
+                    if !running.load(Ordering::Acquire) {
+                        break;
+                    }
+
+                    // Only post if UI thread is ready for the next frame (prevents message flooding)
+                    if !frame_pending.swap(true, Ordering::AcqRel) {
+                        let hwnd_raw = hwnd_isize as *mut c_void;
+                        let hwnd = HWND(hwnd_raw);
+                        // SAFETY: Posting WM_APP_FRAME to the UI thread window.
+                        unsafe {
+                            let _ = PostMessageW(hwnd, WM_APP_FRAME, WPARAM(0), LPARAM(0));
+                        }
+                    }
+                }
+            });
+
+        match handle {
+            Ok(h) => {
+                self.thread_handle = Some(h);
+                true
+            }
+            Err(_) => {
+                self.fallback_to_timer.store(true, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    /// Stops and joins the DWM flush pacing thread.
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        if let Some(handle) = self.thread_handle.take() {
+            let _ = handle.join();
+        }
+        self.frame_pending.store(false, Ordering::Release);
+    }
+
+    /// Notifies the pacer that a pending frame has been processed by the UI thread.
+    pub fn notify_frame_processed(&self) {
+        self.frame_pending.store(false, Ordering::Release);
+    }
+
+    /// Returns true if DWM pacing has failed and timer fallback should be used.
+    #[must_use]
+    pub fn is_fallback(&self) -> bool {
+        self.fallback_to_timer.load(Ordering::Acquire)
+    }
+}
+
+impl Default for DwmPacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Debug-only frame interval logger writing to %TEMP%\godnotch-frames.csv when GODNOTCH_FRAMELOG=1.
+#[cfg(debug_assertions)]
+pub struct FrameLogger {
+    pub enabled: bool,
+    pub log_path: std::path::PathBuf,
+    pub frame_count: u64,
+}
+
+#[cfg(debug_assertions)]
+impl FrameLogger {
+    #[must_use]
+    pub fn init() -> Self {
+        let enabled = std::env::var_os("GODNOTCH_FRAMELOG").is_some();
+        let log_path = std::env::temp_dir().join("godnotch-frames.csv");
+        if enabled && !log_path.exists() {
+            let _ = std::fs::write(&log_path, "frame_index,dt_ms,method\n");
+        }
+        Self {
+            enabled,
+            log_path,
+            frame_count: 0,
+        }
+    }
+
+    pub fn record_frame(&mut self, dt_ms: f32, method: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.frame_count += 1;
+        let line = format!("{},{:.3},{}\n", self.frame_count, dt_ms, method);
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
 /// Internal state of the interactive layered notch window.
 pub struct NotchWindowState {
     #[allow(dead_code)] // Fase 1
@@ -84,12 +248,16 @@ pub struct NotchWindowState {
     pub pixmap: Pixmap,
 
     pub is_tracking_leave: bool,
+    pub pacer: DwmPacer,
     #[cfg(debug_assertions)]
     pub debug_timer_stats: DebugTimerStats,
+    #[cfg(debug_assertions)]
+    pub frame_logger: FrameLogger,
 }
 
 impl Drop for NotchWindowState {
     fn drop(&mut self) {
+        self.pacer.stop();
         if !self.mem_dc.is_invalid() {
             // SAFETY: Deleting memory DC and bitmap allocated for DIB Section.
             unsafe {
@@ -127,7 +295,7 @@ impl NotchWindowState {
         Ok(())
     }
 
-    /// Kicks the 16ms animation timer if not already running.
+    /// Kicks the animation pacing mechanism (DWM VSync thread with SetTimer fallback).
     pub fn kick_anim(&mut self, hwnd: HWND) {
         if !self.animating {
             self.animating = true;
@@ -136,21 +304,27 @@ impl NotchWindowState {
                 self.debug_timer_stats.is_anim_timer_active = true;
             }
             self.last_frame = Instant::now();
-            // SAFETY: Starting the one-shot animation timer (16ms interval).
-            unsafe {
-                SetTimer(hwnd, TIMER_ANIM, ANIM_FRAME_MS, None);
+
+            let started_dwm = self.pacer.start(hwnd);
+            if !started_dwm || self.pacer.is_fallback() {
+                // Fallback to 16ms timer
+                // SAFETY: Starting fallback animation timer (16ms interval).
+                unsafe {
+                    SetTimer(hwnd, TIMER_ANIM, ANIM_FRAME_MS, None);
+                }
             }
         }
     }
 
-    /// Stops the 16ms animation timer.
+    /// Stops animation pacing and joins any running worker threads.
     pub fn stop_anim(&mut self, hwnd: HWND) {
         self.animating = false;
         #[cfg(debug_assertions)]
         {
             self.debug_timer_stats.is_anim_timer_active = false;
         }
-        // SAFETY: Killing the animation timer upon settling to achieve 0% idle CPU.
+        self.pacer.stop();
+        // SAFETY: Killing any active fallback animation timer.
         unsafe {
             let _ = KillTimer(hwnd, TIMER_ANIM);
         }
@@ -325,8 +499,11 @@ impl NotchWindow {
             dirty: true,
             pixmap,
             is_tracking_leave: false,
+            pacer: DwmPacer::new(),
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
+            #[cfg(debug_assertions)]
+            frame_logger: FrameLogger::init(),
         }));
 
         // Initial render in closed state into DIB section
@@ -450,6 +627,52 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             LRESULT(0)
         }
 
+        WM_APP_FRAME => {
+            // Driven by DwmFlush VSync pacer thread
+            let frame_res = unsafe {
+                with_state(raw_cell, |state| {
+                    state.pacer.notify_frame_processed();
+                    #[cfg(debug_assertions)]
+                    {
+                        state.debug_timer_stats.anim_ticks += 1;
+                    }
+                    let now = Instant::now();
+                    let dt = (now - state.last_frame).as_secs_f32();
+                    state.last_frame = now;
+
+                    #[cfg(debug_assertions)]
+                    {
+                        state.frame_logger.record_frame(dt * 1000.0, "dwm");
+                    }
+
+                    let settled = state.motion.step(dt);
+                    state.dirty = true;
+                    let _ = state.render_buffer();
+                    (
+                        settled,
+                        state.mem_dc,
+                        state.screen_w,
+                        state.canvas_w,
+                        state.canvas_h,
+                    )
+                })
+            };
+
+            if let Some((settled, mem_dc, screen_w, canvas_w, canvas_h)) = frame_res {
+                // SAFETY: Presenting layered window without holding any borrow on state.
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+                if settled {
+                    // SAFETY: raw_cell is valid; stopping animation on settle.
+                    unsafe {
+                        with_state(raw_cell, |state| state.stop_anim(hwnd));
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
         WM_TIMER => {
             let timer_id = wp.0;
 
@@ -486,7 +709,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     });
                 }
             } else if timer_id == TIMER_ANIM {
-                // SAFETY: raw_cell is valid; advancing spring animation frame.
+                // SAFETY: raw_cell is valid; advancing animation frame (timer fallback path).
                 let frame_res = unsafe {
                     with_state(raw_cell, |state| {
                         #[cfg(debug_assertions)]
@@ -496,6 +719,11 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         let now = Instant::now();
                         let dt = (now - state.last_frame).as_secs_f32();
                         state.last_frame = now;
+
+                        #[cfg(debug_assertions)]
+                        {
+                            state.frame_logger.record_frame(dt * 1000.0, "timer");
+                        }
 
                         let settled = state.motion.step(dt);
                         state.dirty = true;
@@ -584,8 +812,11 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_DESTROY => {
-            // SAFETY: Terminating timers and posting quit message to exit GetMessageW loop.
+            // SAFETY: Stopping pacer thread, terminating timers, and posting quit message.
             unsafe {
+                with_state(raw_cell, |state| {
+                    state.pacer.stop();
+                });
                 let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
                 let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
                 let _ = KillTimer(hwnd, TIMER_ANIM);
@@ -599,7 +830,8 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             // to prevent Use-After-Free in any subsequent or re-entrant window procedure calls.
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                let _ = Box::from_raw(raw_cell as *mut RefCell<NotchWindowState>);
+                let mut boxed_state = Box::from_raw(raw_cell as *mut RefCell<NotchWindowState>);
+                boxed_state.get_mut().pacer.stop();
                 DefWindowProcW(hwnd, msg, wp, lp)
             }
         }
