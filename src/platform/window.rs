@@ -13,7 +13,9 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use tiny_skia::Pixmap;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Foundation::{
+    COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, SYSTEMTIME, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
@@ -33,8 +35,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_MOUSEMOVE,
-    WM_NCDESTROY, WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -44,13 +46,16 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Custom message posted by the DWM VSync pacer thread to drive UI animation frames.
 pub const WM_APP_FRAME: u32 = WM_APP + 1;
 
+use crate::core::i18n::{self, Language, TimeFormat};
 use crate::core::layout;
 use crate::core::motion::{Motion, MotionDirection};
 use crate::core::renderer;
+use crate::core::text::FontRenderer;
 
 const TIMER_OPEN_DELAY: usize = 101;
 const TIMER_CLOSE_DELAY: usize = 102;
 const TIMER_ANIM: usize = 103;
+const TIMER_MINUTE_CLOCK: usize = 104;
 
 const OPEN_DELAY_MS: u32 = 80;
 const CLOSE_DELAY_MS: u32 = 300;
@@ -263,6 +268,36 @@ impl FrameLogger {
     }
 }
 
+/// Queries the Windows system time format (12-hour or 24-hour).
+#[must_use]
+pub fn query_system_time_format() -> TimeFormat {
+    use windows::Win32::Globalization::GetLocaleInfoEx;
+    const LOCALE_ITIME: u32 = 0x0000_0028;
+    let mut buf = [0u16; 8];
+    // SAFETY: Querying user default locale time format (12/24 hour). Passing null PCWSTR selects LOCALE_NAME_USER_DEFAULT.
+    let ret = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_ITIME, Some(&mut buf)) };
+    if ret > 0 && buf[0] == b'0' as u16 {
+        TimeFormat::Hour12
+    } else {
+        TimeFormat::Hour24
+    }
+}
+
+/// Queries the Windows user default locale language (Indonesian or English).
+#[must_use]
+pub fn query_user_locale_language() -> Language {
+    use windows::Win32::Globalization::GetUserDefaultLocaleName;
+    let mut buf = [0u16; 85];
+    // SAFETY: Querying user default locale name string (BCP-47).
+    let ret = unsafe { GetUserDefaultLocaleName(&mut buf) };
+    if ret > 1 {
+        let name = String::from_utf16_lossy(&buf[..ret as usize - 1]);
+        Language::from_locale_name(&name)
+    } else {
+        Language::Indonesian
+    }
+}
+
 /// Internal state of the interactive layered notch window.
 pub struct NotchWindowState {
     #[allow(dead_code)] // Fase 1
@@ -280,6 +315,16 @@ pub struct NotchWindowState {
     pub last_frame: Instant,
     pub dirty: bool,
     pub pixmap: Pixmap,
+
+    pub font_renderer: FontRenderer,
+    pub time_format: TimeFormat,
+    pub language: Language,
+    pub current_hour: u16,
+    pub current_minute: u16,
+    pub current_day_of_week: u16,
+    pub current_day: u16,
+    pub current_month: u16,
+    pub current_year: u16,
 
     pub is_tracking_leave: bool,
     pub pacer: DwmPacer,
@@ -305,6 +350,25 @@ impl Drop for NotchWindowState {
 }
 
 impl NotchWindowState {
+    /// Updates the cached system time and returns true if minute or date changed.
+    pub fn update_time(&mut self, st: &SYSTEMTIME) -> bool {
+        let changed = self.current_hour != st.wHour
+            || self.current_minute != st.wMinute
+            || self.current_day != st.wDay
+            || self.current_month != st.wMonth
+            || self.current_year != st.wYear;
+        if changed {
+            self.current_hour = st.wHour;
+            self.current_minute = st.wMinute;
+            self.current_day_of_week = st.wDayOfWeek;
+            self.current_day = st.wDay;
+            self.current_month = st.wMonth;
+            self.current_year = st.wYear;
+            self.dirty = true;
+        }
+        changed
+    }
+
     /// Renders the notch shape into the local DIB pixel buffer.
     /// This function performs purely CPU-bound rasterization and does NOT make
     /// Win32 presentation calls, ensuring it is safe to execute while borrowed.
@@ -319,6 +383,84 @@ impl NotchWindowState {
             self.scale,
         );
         renderer::render_notch(&mut self.pixmap.as_mut(), &geom);
+
+        let p_h = self.motion.height_progress();
+        let closed_alpha = layout::closed_content_alpha(p_h);
+        let open_alpha = layout::open_content_alpha(p_h);
+
+        // 1. Closed state content: clock centered in closed notch
+        if closed_alpha > 0.001 {
+            let clock_str =
+                i18n::format_time(self.time_format, self.current_hour, self.current_minute);
+            let font_size = (layout::CLOSED_CLOCK_FONT_SIZE * self.scale).round() as u32;
+            let text_w = self
+                .font_renderer
+                .measure_text_width(&clock_str, font_size, true);
+
+            let text_x = geom.x + (geom.width - text_w) / 2.0;
+            let text_y = geom.y + (20.0 * self.scale).round();
+
+            self.font_renderer.draw_text(
+                &mut self.pixmap.as_mut(),
+                &clock_str,
+                text_x,
+                text_y,
+                font_size,
+                (255, 255, 255),
+                closed_alpha,
+                true,
+            );
+        }
+
+        // 2. Open state content: large clock + date
+        if open_alpha > 0.001 {
+            let clock_str =
+                i18n::format_time(self.time_format, self.current_hour, self.current_minute);
+            let font_size_clock = (layout::OPEN_CLOCK_FONT_SIZE * self.scale).round() as u32;
+            let clock_w = self
+                .font_renderer
+                .measure_text_width(&clock_str, font_size_clock, true);
+
+            let clock_x = geom.x + (geom.width - clock_w) / 2.0;
+            let clock_y = geom.y + (48.0 * self.scale).round();
+
+            self.font_renderer.draw_text(
+                &mut self.pixmap.as_mut(),
+                &clock_str,
+                clock_x,
+                clock_y,
+                font_size_clock,
+                (255, 255, 255),
+                open_alpha,
+                true,
+            );
+
+            let date_str = i18n::format_date(
+                self.language,
+                self.current_day_of_week,
+                self.current_day,
+                self.current_month,
+                self.current_year,
+            );
+            let font_size_date = (layout::OPEN_DATE_FONT_SIZE * self.scale).round() as u32;
+            let date_w = self
+                .font_renderer
+                .measure_text_width(&date_str, font_size_date, false);
+
+            let date_x = geom.x + (geom.width - date_w) / 2.0;
+            let date_y = geom.y + (74.0 * self.scale).round();
+
+            self.font_renderer.draw_text(
+                &mut self.pixmap.as_mut(),
+                &date_str,
+                date_x,
+                date_y,
+                font_size_date,
+                (170, 170, 175), // #AAAAAF
+                open_alpha,
+                false,
+            );
+        }
 
         let src = self.pixmap.data();
         // SAFETY: bits pointer was allocated by CreateDIBSection with size canvas_w * canvas_h * 4.
@@ -518,6 +660,12 @@ impl NotchWindow {
 
         let pixmap = Pixmap::new(canvas.width, canvas.height).ok_or_else(Error::from_win32)?;
 
+        // SAFETY: Querying current local system time.
+        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        let time_format = query_system_time_format();
+        let language = query_user_locale_language();
+        let font_renderer = FontRenderer::new();
+
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
             mem_dc,
@@ -532,6 +680,15 @@ impl NotchWindow {
             last_frame: Instant::now(),
             dirty: true,
             pixmap,
+            font_renderer,
+            time_format,
+            language,
+            current_hour: st.wHour,
+            current_minute: st.wMinute,
+            current_day_of_week: st.wDayOfWeek,
+            current_day: st.wDay,
+            current_month: st.wMonth,
+            current_year: st.wYear,
             is_tracking_leave: false,
             pacer: DwmPacer::new(),
             #[cfg(debug_assertions)]
@@ -557,6 +714,13 @@ impl NotchWindow {
         // SAFETY: Displaying window without activating or stealing focus.
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+
+        let delay_ms =
+            layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
+        // SAFETY: Setting initial one-shot timer to the next minute boundary.
+        unsafe {
+            SetTimer(hwnd, TIMER_MINUTE_CLOCK, delay_ms, None);
         }
 
         Ok(Self { hwnd })
@@ -742,6 +906,42 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         state.kick_anim(hwnd);
                     });
                 }
+            } else if timer_id == TIMER_MINUTE_CLOCK {
+                // SAFETY: Killing one-shot minute clock timer.
+                unsafe {
+                    let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
+                }
+                // SAFETY: Querying updated local system time.
+                let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+                let next_delay = layout::calculate_next_minute_delay_ms(
+                    st.wSecond as u32,
+                    st.wMilliseconds as u32,
+                );
+                // SAFETY: Scheduling one-shot timer for the next minute boundary.
+                unsafe {
+                    SetTimer(hwnd, TIMER_MINUTE_CLOCK, next_delay, None);
+                }
+
+                // SAFETY: Updating state and re-rendering if minute changed and not currently animating.
+                let render_res = unsafe {
+                    with_state(raw_cell, |state| {
+                        let changed = state.update_time(&st);
+                        if changed && !state.animating {
+                            state.dirty = true;
+                            let _ = state.render_buffer();
+                            Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
+                        } else {
+                            None
+                        }
+                    })
+                };
+
+                if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) = render_res {
+                    // SAFETY: Presenting window without holding state borrow.
+                    unsafe {
+                        let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                    }
+                }
             } else if timer_id == TIMER_ANIM {
                 // SAFETY: raw_cell is valid; advancing animation frame (timer fallback path).
                 let frame_res = unsafe {
@@ -845,6 +1045,48 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             LRESULT(0)
         }
 
+        WM_TIMECHANGE => {
+            // System time, time zone, or daylight saving time changed, or waking from sleep.
+            // SAFETY: Killing existing minute clock timer.
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
+            }
+            // SAFETY: Querying current system time after time change event.
+            let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+            let time_format = query_system_time_format();
+            let language = query_user_locale_language();
+            let next_delay =
+                layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
+            // SAFETY: Arming new one-shot timer aligned to the new minute boundary.
+            unsafe {
+                SetTimer(hwnd, TIMER_MINUTE_CLOCK, next_delay, None);
+            }
+
+            // SAFETY: Updating cached format/locale/time and redrawing if not animating.
+            let render_res = unsafe {
+                with_state(raw_cell, |state| {
+                    state.time_format = time_format;
+                    state.language = language;
+                    state.update_time(&st);
+                    if !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) = render_res {
+                // SAFETY: Presenting window without holding state borrow.
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+            }
+            LRESULT(0)
+        }
+
         WM_DESTROY => {
             // SAFETY: Stopping pacer thread, terminating timers, and posting quit message.
             unsafe {
@@ -854,6 +1096,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
                 let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
                 let _ = KillTimer(hwnd, TIMER_ANIM);
+                let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -1006,6 +1249,7 @@ unsafe extern "system" fn message_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     #[test]
     fn test_message_only_window_creation() {
@@ -1473,6 +1717,57 @@ mod tests {
                 0.0
             },
             total_ms
+        );
+    }
+
+    #[test]
+    fn test_minute_clock_timer_scheduling_and_trigger() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for clock timer test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Verify initial state has valid time
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(s.current_hour <= 23);
+                assert!(s.current_minute <= 59);
+            });
+        }
+
+        // Simulate WM_TIMER for TIMER_MINUTE_CLOCK
+        // SAFETY: Dispatching synthetic WM_TIMER for the minute clock
+        let lres = unsafe { SendMessageW(hwnd, WM_TIMER, WPARAM(TIMER_MINUTE_CLOCK), LPARAM(0)) };
+        assert_eq!(lres.0, 0);
+
+        println!("[B4 MINUTE_CLOCK] Successfully processed TIMER_MINUTE_CLOCK and re-armed timer");
+    }
+
+    #[test]
+    fn test_wm_timechange_handling() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for timechange test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Simulate WM_TIMECHANGE
+        // SAFETY: Dispatching synthetic WM_TIMECHANGE
+        let lres = unsafe { SendMessageW(hwnd, WM_TIMECHANGE, WPARAM(0), LPARAM(0)) };
+        assert_eq!(lres.0, 0);
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(s.current_hour <= 23);
+                assert!(s.current_minute <= 59);
+            });
+        }
+
+        println!(
+            "[B4 TIMECHANGE] Successfully handled WM_TIMECHANGE, re-queried formats and refreshed timer"
         );
     }
 }
