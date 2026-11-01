@@ -13,6 +13,7 @@ pub mod fullscreen;
 pub mod http;
 pub mod media;
 pub mod power;
+pub mod scheduler;
 pub mod single_instance;
 pub mod storage;
 pub mod tray;
@@ -20,9 +21,11 @@ pub mod window;
 
 #[allow(unused_imports)]
 pub use fullscreen::FullscreenWatcher;
+#[allow(unused_imports)]
+pub use scheduler::PlatformTimeSource;
 pub use single_instance::SingleInstance;
 #[allow(unused_imports)]
-pub use storage::{LoadOutcome, SettingsStorage};
+pub use storage::{LoadOutcome, ScheduleStorage, SettingsStorage};
 #[allow(unused_imports)]
 pub use tray::{TrayIcon, TrayMenuCommand};
 pub use window::{NotchWindow, run_message_loop, set_dpi_awareness_v2};

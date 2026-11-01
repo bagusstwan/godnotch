@@ -54,13 +54,20 @@ use crate::core::i18n::{self, Language, TimeFormat};
 use crate::core::layout;
 use crate::core::motion::{Motion, MotionDirection};
 use crate::core::renderer;
+use crate::core::scheduler::TimeSource;
 use crate::core::text::FontRenderer;
-use crate::platform::storage::SettingsStorage;
+use crate::platform::scheduler::PlatformTimeSource;
+use crate::platform::storage::{ScheduleStorage, SettingsStorage};
 
 const TIMER_OPEN_DELAY: usize = 101;
 const TIMER_CLOSE_DELAY: usize = 102;
 const TIMER_ANIM: usize = 103;
 const TIMER_MINUTE_CLOCK: usize = 104;
+const TIMER_SCHEDULER: usize = 106;
+
+const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
 
 const ANIM_FRAME_MS: u32 = 16;
 
@@ -338,6 +345,9 @@ pub struct NotchWindowState {
     pub watcher: Option<crate::platform::fullscreen::FullscreenWatcher>,
     pub storage: SettingsStorage,
     pub settings: Settings,
+    pub scheduler: crate::core::scheduler::Scheduler,
+    pub schedule_storage: ScheduleStorage,
+    pub dispatched_events: Vec<crate::core::scheduler::SchedEvent>,
     pub open_delay_ms: u32,
     pub close_delay_ms: u32,
     pub ui: crate::core::ui::UiContext,
@@ -524,6 +534,158 @@ impl NotchWindowState {
                 _ => {}
             }
         }
+    }
+
+    /// Polls due schedules at the current wall clock time, saves updated schedules if any fired,
+    /// and arms the next one-shot scheduler timer.
+    pub fn poll_and_rearm_scheduler(
+        &mut self,
+        hwnd: HWND,
+    ) -> Vec<crate::core::scheduler::SchedEvent> {
+        let now_utc = PlatformTimeSource.now_utc_ms();
+        let events = self.scheduler.poll(now_utc, &PlatformTimeSource);
+        if !events.is_empty() {
+            let _ = self.schedule_storage.save(&self.scheduler);
+            self.dispatched_events.extend(events.clone());
+        }
+        self.rearm_scheduler_timer(hwnd);
+        events
+    }
+
+    /// Arms the single one-shot scheduler timer for the earliest pending schedule.
+    /// If no schedules exist, any existing timer is killed and no timer is running.
+    pub fn rearm_scheduler_timer(&mut self, hwnd: HWND) {
+        // SAFETY: Killing any existing one-shot scheduler timer.
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_SCHEDULER);
+        }
+        let now_utc = PlatformTimeSource.now_utc_ms();
+        if let Some(delay_ms) = self.scheduler.next_wakeup_clamped(now_utc) {
+            // SAFETY: Arming single one-shot scheduler timer.
+            unsafe {
+                SetTimer(hwnd, TIMER_SCHEDULER, delay_ms, None);
+            }
+        }
+    }
+
+    /// Reschedules all entries and re-evaluates missed events following clock shift or power resume.
+    pub fn reschedule_and_rearm_scheduler(&mut self, hwnd: HWND) {
+        let now_utc = PlatformTimeSource.now_utc_ms();
+        let events = self.scheduler.poll(now_utc, &PlatformTimeSource);
+        if !events.is_empty() {
+            self.dispatched_events.extend(events);
+        }
+        self.scheduler.reschedule_all(now_utc, &PlatformTimeSource);
+        let _ = self.schedule_storage.save(&self.scheduler);
+        self.rearm_scheduler_timer(hwnd);
+    }
+
+    /// Adds a new schedule entry, saves to disk, and re-arms the one-shot timer.
+    #[allow(dead_code)] // Fase 2 T2.2
+    pub fn add_schedule(
+        &mut self,
+        entry: crate::core::scheduler::ScheduleEntry,
+        hwnd: HWND,
+    ) -> std::result::Result<(), crate::core::scheduler::ScheduleError> {
+        self.scheduler.add(entry)?;
+        let _ = self.schedule_storage.save(&self.scheduler);
+        self.rearm_scheduler_timer(hwnd);
+        Ok(())
+    }
+
+    /// Removes a schedule entry by ID, saves to disk, and re-arms the one-shot timer.
+    #[allow(dead_code)] // Fase 2 T2.2
+    pub fn remove_schedule(&mut self, id: u32, hwnd: HWND) -> bool {
+        let removed = self.scheduler.remove(id);
+        if removed {
+            let _ = self.schedule_storage.save(&self.scheduler);
+            self.rearm_scheduler_timer(hwnd);
+        }
+        removed
+    }
+
+    /// Schedules 3 demo tasks for developer testing and verification (`sched-demo` feature):
+    /// 1. Once in 20s (FireOnce, grace 10m)
+    /// 2. Interval 60s (FireOnce)
+    /// 3. DailyAt now + 3m (FireOnce, grace 10m)
+    #[cfg(feature = "sched-demo")]
+    pub fn add_demo_schedules(&mut self, hwnd: HWND) {
+        use crate::core::scheduler::{
+            IntervalAnchor, MisfirePolicy, Payload, Recurrence, ScheduleEntry,
+            compute_next_daily_at,
+        };
+
+        let now_utc = PlatformTimeSource.now_utc_ms();
+
+        // 1. Once in 20 seconds (FireOnce, grace 10 minutes)
+        let _ = self.add_schedule(
+            ScheduleEntry {
+                id: 9001,
+                kind: 99,
+                recurrence: Recurrence::Once {
+                    at_utc_ms: now_utc + 20_000,
+                },
+                misfire_policy: MisfirePolicy::FireOnce {
+                    grace_ms: 10 * 60 * 1000,
+                },
+                payload: Payload::empty(),
+                next_due_utc_ms: now_utc + 20_000,
+                last_fired_utc_ms: None,
+            },
+            hwnd,
+        );
+
+        // 2. Interval 60 seconds (FireOnce)
+        let _ = self.add_schedule(
+            ScheduleEntry {
+                id: 9002,
+                kind: 99,
+                recurrence: Recurrence::Interval {
+                    every_ms: 60_000,
+                    anchor: IntervalAnchor::FromFire,
+                },
+                misfire_policy: MisfirePolicy::FireOnce {
+                    grace_ms: 10 * 60 * 1000,
+                },
+                payload: Payload::empty(),
+                next_due_utc_ms: now_utc + 60_000,
+                last_fired_utc_ms: None,
+            },
+            hwnd,
+        );
+
+        // 3. DailyAt now + 3 minutes (FireOnce, grace 10 minutes)
+        let local = PlatformTimeSource.utc_to_local(now_utc);
+        let total_mins = (local.hour * 60 + local.minute + 3) % (24 * 60);
+        let target_h = total_mins / 60;
+        let target_m = total_mins % 60;
+        let next_due = compute_next_daily_at(now_utc, target_h, target_m, &PlatformTimeSource);
+
+        let _ = self.add_schedule(
+            ScheduleEntry {
+                id: 9003,
+                kind: 99,
+                recurrence: Recurrence::DailyAt {
+                    hour: target_h,
+                    minute: target_m,
+                },
+                misfire_policy: MisfirePolicy::FireOnce {
+                    grace_ms: 10 * 60 * 1000,
+                },
+                payload: Payload::empty(),
+                next_due_utc_ms: next_due,
+                last_fired_utc_ms: None,
+            },
+            hwnd,
+        );
+    }
+
+    /// Removes the 3 demo schedules from the scheduler.
+    #[cfg(feature = "sched-demo")]
+    pub fn remove_demo_schedules(&mut self, hwnd: HWND) {
+        self.remove_schedule(9001, hwnd);
+        self.remove_schedule(9002, hwnd);
+        self.remove_schedule(9003, hwnd);
     }
 
     /// Renders the notch shape into the local DIB pixel buffer.
@@ -1176,6 +1338,10 @@ impl NotchWindow {
             (None, false)
         };
 
+        let schedule_storage = ScheduleStorage::new_custom(storage.base_dir().to_path_buf());
+        let now_utc = PlatformTimeSource.now_utc_ms();
+        let (scheduler, _sched_outcome) = schedule_storage.load(now_utc);
+
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
             mem_dc,
@@ -1208,6 +1374,9 @@ impl NotchWindow {
             watcher: watcher_opt,
             storage,
             settings,
+            scheduler,
+            schedule_storage,
+            dispatched_events: Vec::new(),
             open_delay_ms,
             close_delay_ms,
             ui: crate::core::ui::UiContext::new(),
@@ -1231,6 +1400,10 @@ impl NotchWindow {
         // SAFETY: Storing the heap-allocated RefCell<NotchWindowState> pointer in window user data.
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, raw_ptr as isize);
+            // SAFETY: Evaluating startup schedules and arming one-shot scheduler timer if needed.
+            with_state(raw_ptr, |s| {
+                s.poll_and_rearm_scheduler(hwnd);
+            });
         }
 
         // Phase 4: Initial UpdateLayeredWindow presentation
@@ -1812,8 +1985,39 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         });
                     }
                 }
+            } else if timer_id == TIMER_SCHEDULER {
+                // SAFETY: Killing one-shot scheduler timer.
+                unsafe {
+                    let _ = KillTimer(hwnd, TIMER_SCHEDULER);
+                }
+                let events =
+                    unsafe { with_state(raw_cell, |state| state.poll_and_rearm_scheduler(hwnd)) };
+                #[cfg(feature = "sched-demo")]
+                {
+                    if let Some(evs) = events {
+                        for ev in &evs {
+                            crate::platform::scheduler::handle_demo_event(ev);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "sched-demo"))]
+                {
+                    let _ = events;
+                }
             }
             LRESULT(0)
+        }
+
+        WM_POWERBROADCAST => {
+            // SAFETY: System resuming from sleep / suspend.
+            if wp.0 == PBT_APMRESUMEAUTOMATIC || wp.0 == PBT_APMRESUMESUSPEND {
+                unsafe {
+                    with_state(raw_cell, |state| {
+                        state.reschedule_and_rearm_scheduler(hwnd);
+                    });
+                }
+            }
+            LRESULT(1)
         }
 
         WM_RBUTTONUP => {
@@ -1859,6 +2063,13 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
         WM_TIMECHANGE => {
             // System time, time zone, or daylight saving time changed, or waking from sleep.
+            // SAFETY: Rescheduling all schedule entries and re-arming scheduler timer.
+            unsafe {
+                with_state(raw_cell, |state| {
+                    state.reschedule_and_rearm_scheduler(hwnd);
+                });
+            }
+
             // SAFETY: Killing existing minute clock timer.
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
@@ -2020,6 +2231,18 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                                     }
                                 }
                             }
+                            #[cfg(feature = "sched-demo")]
+                            crate::platform::tray::TrayMenuCommand::TestScheduler => unsafe {
+                                with_state(raw_cell, |state| {
+                                    state.add_demo_schedules(hwnd);
+                                });
+                            },
+                            #[cfg(feature = "sched-demo")]
+                            crate::platform::tray::TrayMenuCommand::RemoveTestSchedules => unsafe {
+                                with_state(raw_cell, |state| {
+                                    state.remove_demo_schedules(hwnd);
+                                });
+                            },
                             crate::platform::tray::TrayMenuCommand::Exit => {
                                 // SAFETY: Destroying window upon user exit request from tray menu.
                                 unsafe {
@@ -3349,5 +3572,186 @@ mod tests {
         println!(
             "[F1 UI_DEMO] Successfully verified button clicks, counter increments, and row selection"
         );
+    }
+
+    #[test]
+    fn test_scheduler_platform_integration() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PM_REMOVE, PeekMessageW, SendMessageW, TranslateMessage,
+        };
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for scheduler test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // 1. Add a Once ~300 ms schedule
+        let now_utc = PlatformTimeSource.now_utc_ms();
+        let entry_id = 999;
+        unsafe {
+            with_state(raw_cell, |state| {
+                state
+                    .add_schedule(
+                        crate::core::scheduler::ScheduleEntry {
+                            id: entry_id,
+                            kind: 1,
+                            recurrence: crate::core::scheduler::Recurrence::Once {
+                                at_utc_ms: now_utc + 300,
+                            },
+                            misfire_policy: crate::core::scheduler::MisfirePolicy::FireOnce {
+                                grace_ms: 5000,
+                            },
+                            payload: crate::core::scheduler::Payload::from_u32(0x1234),
+                            next_due_utc_ms: now_utc + 300,
+                            last_fired_utc_ms: None,
+                        },
+                        hwnd,
+                    )
+                    .expect("Failed to add schedule");
+            });
+        }
+
+        // Pump messages until event fires (up to 2000 ms)
+        let start = Instant::now();
+        let mut fired = false;
+        let mut msg = MSG::default();
+        while start.elapsed() < Duration::from_millis(2000) {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let count = unsafe {
+                with_state(raw_cell, |state| {
+                    state
+                        .dispatched_events
+                        .iter()
+                        .filter(|e| e.id == entry_id)
+                        .count()
+                })
+                .unwrap_or(0)
+            };
+            if count == 1 {
+                fired = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(fired, "Once 300ms schedule must fire exactly once");
+
+        // Verify after event, scheduler has 0 entries and next_wakeup is None
+        unsafe {
+            with_state(raw_cell, |state| {
+                assert_eq!(state.scheduler.count(), 0);
+                assert_eq!(state.scheduler.next_wakeup(now_utc + 1000), None);
+            });
+        }
+
+        // 2. Synthetic WM_TIMECHANGE triggers re-evaluation
+        let lres_tc = unsafe { SendMessageW(hwnd, WM_TIMECHANGE, WPARAM(0), LPARAM(0)) };
+        assert_eq!(lres_tc.0, 0);
+
+        // 3. Synthetic WM_POWERBROADCAST triggers re-evaluation
+        let lres_pb = unsafe {
+            SendMessageW(
+                hwnd,
+                WM_POWERBROADCAST,
+                WPARAM(PBT_APMRESUMEAUTOMATIC),
+                LPARAM(0),
+            )
+        };
+        assert_eq!(lres_pb.0, 1);
+
+        // 4. 100 add/remove cycles do not leak
+        unsafe {
+            with_state(raw_cell, |state| {
+                for i in 0..100 {
+                    let id = 1000 + i;
+                    state
+                        .add_schedule(
+                            crate::core::scheduler::ScheduleEntry {
+                                id,
+                                kind: 1,
+                                recurrence: crate::core::scheduler::Recurrence::Once {
+                                    at_utc_ms: now_utc + 10_000 + i as u64,
+                                },
+                                misfire_policy: crate::core::scheduler::MisfirePolicy::Skip {
+                                    grace_ms: 1000,
+                                },
+                                payload: crate::core::scheduler::Payload::empty(),
+                                next_due_utc_ms: now_utc + 10_000 + i as u64,
+                                last_fired_utc_ms: None,
+                            },
+                            hwnd,
+                        )
+                        .expect("Add failed in cycle");
+                    assert!(state.remove_schedule(id, hwnd));
+                }
+                assert_eq!(state.scheduler.count(), 0);
+            });
+        }
+
+        println!(
+            "[T2.2 SCHEDULER] Successfully verified platform scheduler integration, power and time handling"
+        );
+    }
+
+    #[cfg(feature = "sched-demo")]
+    #[test]
+    fn test_sched_demo_feature_lifecycle() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for demo test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // 1. Add demo schedules
+        unsafe {
+            with_state(raw_cell, |state| {
+                state.add_demo_schedules(hwnd);
+                assert_eq!(state.scheduler.count(), 3);
+                assert!(state.scheduler.get(9001).is_some());
+                assert!(state.scheduler.get(9002).is_some());
+                assert!(state.scheduler.get(9003).is_some());
+            });
+        }
+
+        // 2. Remove demo schedules
+        unsafe {
+            with_state(raw_cell, |state| {
+                state.remove_demo_schedules(hwnd);
+                assert_eq!(state.scheduler.count(), 0);
+                assert!(state.scheduler.get(9001).is_none());
+                assert!(state.scheduler.get(9002).is_none());
+                assert!(state.scheduler.get(9003).is_none());
+            });
+        }
+
+        // 3. Test handle_demo_event creates log file
+        let dummy_ev = crate::core::scheduler::SchedEvent {
+            id: 9001,
+            kind: 99,
+            payload: crate::core::scheduler::Payload::empty(),
+            due_utc_ms: 1_700_000_000_000,
+            fired_utc_ms: 1_700_000_000_010,
+            late_by_ms: 10,
+            missed_count: 0,
+        };
+        crate::platform::scheduler::handle_demo_event(&dummy_ev);
+        let log_path = std::env::temp_dir().join("godnotch-sched-demo.log");
+        assert!(
+            log_path.exists(),
+            "%TEMP%\\godnotch-sched-demo.log must exist after demo event"
+        );
+        let content = std::fs::read_to_string(&log_path).expect("Log file readable");
+        assert!(content.contains("1700000000010,1700000000000,10,0,9001,99"));
+        let _ = std::fs::remove_file(&log_path);
+
+        println!("[T2.2 SCHED_DEMO] Successfully verified sched-demo lifecycle and logging");
     }
 }
