@@ -37,14 +37,29 @@ pub const TRAY_ICON_UID: u32 = 101;
 /// Menu item identifier for toggling "Mulai bersama Windows" (Start with Windows).
 pub const IDM_AUTOSTART: usize = 1001;
 
+/// Menu item identifier for toggling "Sembunyikan saat layar penuh" (Hide on fullscreen).
+pub const IDM_HIDE_ON_FULLSCREEN: usize = 1002;
+
+/// Menu item identifier for "Buka berkas pengaturan" (Open settings file).
+pub const IDM_OPEN_SETTINGS_FILE: usize = 1003;
+
+/// Menu item identifier for "Muat ulang pengaturan" (Reload settings).
+pub const IDM_RELOAD_SETTINGS: usize = 1004;
+
 /// Menu item identifier for "Keluar" (Exit).
-pub const IDM_EXIT: usize = 1002;
+pub const IDM_EXIT: usize = 1005;
 
 /// Action triggered by the user from the tray context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayMenuCommand {
     /// Toggle whether the application runs automatically on user login.
     ToggleAutostart,
+    /// Toggle whether the notch hides when a fullscreen window is active.
+    ToggleHideOnFullscreen,
+    /// Open settings.json in the default text editor.
+    OpenSettingsFile,
+    /// Reload settings.json from disk and apply changes live.
+    ReloadSettings,
     /// Terminate the application cleanly.
     Exit,
 }
@@ -325,6 +340,7 @@ pub fn show_context_menu(
     hwnd: HWND,
     pos: Option<POINT>,
     is_autostart_checked: bool,
+    hide_on_fullscreen_checked: bool,
     lang: Language,
 ) -> Option<TrayMenuCommand> {
     let pt = match pos {
@@ -345,6 +361,19 @@ pub fn show_context_menu(
     let autostart_label = i18n::tray_autostart_label(lang);
     let mut autostart_wide: Vec<u16> = autostart_label.encode_utf16().chain(Some(0)).collect();
 
+    let hide_label = i18n::tray_hide_on_fullscreen_label(lang);
+    let mut hide_wide: Vec<u16> = hide_label.encode_utf16().chain(Some(0)).collect();
+
+    let open_settings_label = i18n::tray_open_settings_file_label(lang);
+    let mut open_settings_wide: Vec<u16> =
+        open_settings_label.encode_utf16().chain(Some(0)).collect();
+
+    let reload_settings_label = i18n::tray_reload_settings_label(lang);
+    let mut reload_settings_wide: Vec<u16> = reload_settings_label
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+
     let exit_label = i18n::tray_exit_label(lang);
     let mut exit_wide: Vec<u16> = exit_label.encode_utf16().chain(Some(0)).collect();
 
@@ -355,13 +384,44 @@ pub fn show_context_menu(
             MF_UNCHECKED
         };
 
-    // SAFETY: Appending menu items.
+    let hide_flags = MF_STRING
+        | if hide_on_fullscreen_checked {
+            MF_CHECKED
+        } else {
+            MF_UNCHECKED
+        };
+
+    // SAFETY: Appending menu items:
+    // 1. [x] Mulai bersama Windows
+    // 2. [x] Sembunyikan saat layar penuh
+    // 3. Buka berkas pengaturan
+    // 4. Muat ulang pengaturan
+    // 5. Separator
+    // 6. Keluar
     unsafe {
         let _ = AppendMenuW(
             menu,
             autostart_flags,
             IDM_AUTOSTART,
             PCWSTR::from_raw(autostart_wide.as_mut_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            hide_flags,
+            IDM_HIDE_ON_FULLSCREEN,
+            PCWSTR::from_raw(hide_wide.as_mut_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_OPEN_SETTINGS_FILE,
+            PCWSTR::from_raw(open_settings_wide.as_mut_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            IDM_RELOAD_SETTINGS,
+            PCWSTR::from_raw(reload_settings_wide.as_mut_ptr()),
         );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
@@ -398,6 +458,9 @@ pub fn show_context_menu(
 
     match cmd.0 as usize {
         IDM_AUTOSTART => Some(TrayMenuCommand::ToggleAutostart),
+        IDM_HIDE_ON_FULLSCREEN => Some(TrayMenuCommand::ToggleHideOnFullscreen),
+        IDM_OPEN_SETTINGS_FILE => Some(TrayMenuCommand::OpenSettingsFile),
+        IDM_RELOAD_SETTINGS => Some(TrayMenuCommand::ReloadSettings),
         IDM_EXIT => Some(TrayMenuCommand::Exit),
         _ => None,
     }
