@@ -498,4 +498,84 @@ mod tests {
             true
         ));
     }
+
+    #[test]
+    fn test_chrome_f11_fullscreen_measurements() {
+        // Real measurements from Chrome F11 / YouTube fullscreen on Windows:
+        // class = "Chrome_WidgetWin_1"
+        // style = 0x170B_0000 -> caption = false
+        // window_rect = 0,0 - 1920,1080
+        // monitor_rect = 0,0 - 1920,1080
+        // SHQueryUserNotificationState = 2 (QUNS_BUSY)
+        let class_name = "Chrome_WidgetWin_1";
+        let class_kind = classify_window_class(class_name);
+        assert_eq!(class_kind, WindowClassKind::Normal);
+
+        let style = 0x170B_0000u32;
+        let has_caption = style_has_caption(style);
+        assert!(
+            !has_caption,
+            "Chrome F11 fullscreen must not have caption bit"
+        );
+
+        let win_rect = Rect::new(0, 0, 1920, 1080);
+        let mon_rect = Rect::new(0, 0, 1920, 1080);
+        let is_fs = is_fullscreen(win_rect, mon_rect, has_caption, class_kind);
+        assert!(
+            is_fs,
+            "Chrome F11 fullscreen geometry must satisfy fullscreen"
+        );
+
+        let notif_state = UserNotificationState::Busy;
+        let is_on_mon = is_window_on_monitor(win_rect, mon_rect);
+        let hide = should_hide_notch(is_fs, notif_state, is_on_mon);
+        assert!(
+            hide,
+            "Notch must be hidden when Chrome is in F11 fullscreen"
+        );
+    }
+
+    #[test]
+    fn test_chrome_maximized_measurements() {
+        // Real measurements from Chrome Maximized (non-fullscreen) on Windows:
+        // class = "Chrome_WidgetWin_1"
+        // style = 0x17CF_0000 -> caption = true
+        // window_rect = -9,-9 - 1929,1089 (extends beyond monitor for border sizing)
+        // monitor_rect = 0,0 - 1920,1080
+        let class_name = "Chrome_WidgetWin_1";
+        let class_kind = classify_window_class(class_name);
+        assert_eq!(class_kind, WindowClassKind::Normal);
+
+        let style = 0x17CF_0000u32;
+        let has_caption = style_has_caption(style);
+        assert!(has_caption, "Chrome maximized must have caption bit set");
+
+        let win_rect = Rect::new(-9, -9, 1929, 1089);
+        let mon_rect = Rect::new(0, 0, 1920, 1080);
+        let is_fs = is_fullscreen(win_rect, mon_rect, has_caption, class_kind);
+        assert!(!is_fs, "Chrome maximized must NOT satisfy fullscreen");
+
+        let notif_state = UserNotificationState::Normal;
+        let is_on_mon = is_window_on_monitor(win_rect, mon_rect);
+        let hide = should_hide_notch(is_fs, notif_state, is_on_mon);
+        assert!(!hide, "Notch must NOT be hidden when Chrome is maximized");
+    }
+
+    #[test]
+    fn test_youtube_html5_fullscreen_in_chrome() {
+        // YouTube HTML5 fullscreen in Chrome:
+        // class = "Chrome_WidgetWin_1"
+        // caption = false (0x170B_0000)
+        // window_rect = 0,0 - 1920,1080
+        let class_kind = classify_window_class("Chrome_WidgetWin_1");
+        let has_caption = style_has_caption(0x170B_0000);
+        let win_rect = Rect::new(0, 0, 1920, 1080);
+        let mon_rect = Rect::new(0, 0, 1920, 1080);
+        let is_fs = is_fullscreen(win_rect, mon_rect, has_caption, class_kind);
+        let hide = should_hide_notch(is_fs, UserNotificationState::Busy, true);
+        assert!(
+            hide,
+            "YouTube fullscreen in Chrome must trigger notch hiding"
+        );
+    }
 }

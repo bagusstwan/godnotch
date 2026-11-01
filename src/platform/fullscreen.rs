@@ -472,4 +472,76 @@ mod tests {
         // Stop cleanly
         watcher.stop();
     }
+
+    #[test]
+    fn test_reproduce_fullscreen_hide_failure_dropped_consecutive_event() {
+        TARGET_NOTCH_HWND.store(0x1234, Ordering::SeqCst);
+        FOREGROUND_HWND.store(0x2222, Ordering::SeqCst);
+        EVALUATION_PENDING.store(false, Ordering::SeqCst);
+
+        // Event 1: User switches foreground to Chrome
+        unsafe {
+            winevent_callback(
+                HWINEVENTHOOK::default(),
+                EVENT_SYSTEM_FOREGROUND,
+                HWND(0x2222 as *mut _),
+                OBJID_WINDOW.0,
+                0,
+                0,
+                0,
+            );
+        }
+        assert!(
+            EVALUATION_PENDING.load(Ordering::SeqCst),
+            "First event must set EVALUATION_PENDING to true"
+        );
+
+        // In the original unfixed code, EVALUATION_PENDING is never cleared!
+        // When Event 2 arrives (Chrome F11 fullscreen / location change):
+        let second_event_posted = !EVALUATION_PENDING.swap(true, Ordering::AcqRel);
+        assert!(
+            !second_event_posted,
+            "REPRODUCTION PROOF: Second event is dropped because EVALUATION_PENDING was stuck at true!"
+        );
+    }
+
+    #[test]
+    fn test_external_fullscreen_window_detection() {
+        // Spawn an external PowerShell process creating a real borderless fullscreen window
+        let mut child = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object Windows.Forms.Form; $f.FormBorderStyle = 0; $f.WindowState = 2; $f.TopMost = $true; $f.Show(); Start-Sleep -Milliseconds 1500; $f.Close()",
+            ])
+            .spawn()
+            .expect("Failed to spawn powershell fullscreen helper");
+
+        // Give the window time to open and take foreground
+        std::thread::sleep(std::time::Duration::from_millis(600));
+
+        let fg = unsafe { GetForegroundWindow() };
+        println!("[E2E_FS_TEST] Foreground window handle: {:?}", fg);
+
+        let screen_w = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+            )
+        };
+        let screen_h = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+                windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+            )
+        };
+        let mon = Rect::new(0, 0, screen_w, screen_h);
+
+        let is_fs = check_is_fullscreen_covering_monitor(mon, HWND::default());
+        println!("[E2E_FS_TEST] Detected fullscreen: {}", is_fs);
+
+        let _ = child.wait();
+        assert!(
+            is_fs,
+            "External uncaptioned maximized window must be detected as fullscreen covering monitor"
+        );
+    }
 }
