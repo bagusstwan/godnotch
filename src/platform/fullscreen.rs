@@ -709,7 +709,7 @@ mod tests {
             .args([
                 "-NoProfile",
                 "-Command",
-                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object Windows.Forms.Form; $f.FormBorderStyle = 0; $f.WindowState = 2; $f.TopMost = $true; $f.Show(); Start-Sleep -Milliseconds 3000; $f.Close()",
+                "Add-Type -AssemblyName System.Windows.Forms; $f = New-Object Windows.Forms.Form; $f.FormBorderStyle = 0; $f.WindowState = 2; $f.TopMost = $true; $t = New-Object Windows.Forms.Timer; $t.Interval = 3000; $t.add_Tick({ $f.Close(); $t.Stop() }); $t.Start(); [void]$f.ShowDialog()",
             ])
             .spawn()
             .expect("Failed to spawn powershell fullscreen helper");
