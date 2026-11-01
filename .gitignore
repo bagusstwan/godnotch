@@ -1,15 +1,32 @@
+# =============================================================
+# godnotch .gitignore
+# =============================================================
+
+# --- Build output (Rust / Cargo) ---
 /target/
+/dist/
 **/*.rs.bk
 *.pdb
 
-# Dokumentasi internal (tidak dipush)
+# --- Internal files (local only, never published) ---
 /docs/
 /AGENTS.md
 
-.vscode/
-.idea/
-Thumbs.db
-Desktop.ini
+# --- Secrets and local environment ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Logs and temporary files ---
 *.log
 *.tmp
-/dist/
+
+# --- Editor and IDE ---
+.vscode/
+.idea/
+
+# --- OS metadata ---
+Thumbs.db
+Desktop.ini
+.DS_Store
