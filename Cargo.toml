@@ -10,6 +10,10 @@ readme = "README.md"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 
+[features]
+default = []
+ui-demo = []
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",

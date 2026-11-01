@@ -342,6 +342,10 @@ pub struct NotchWindowState {
     pub close_delay_ms: u32,
     pub ui: crate::core::ui::UiContext,
     pub last_action: Option<crate::core::ui::UiAction>,
+    #[cfg(feature = "ui-demo")]
+    pub demo_click_count: u32,
+    #[cfg(feature = "ui-demo")]
+    pub demo_selected_row: Option<u32>,
     #[cfg(debug_assertions)]
     pub debug_timer_stats: DebugTimerStats,
     #[cfg(debug_assertions)]
@@ -506,6 +510,20 @@ impl NotchWindowState {
     /// Dispatches a UI action triggered by user interaction with interactive widgets.
     pub fn handle_ui_action(&mut self, action: crate::core::ui::UiAction) {
         self.last_action = Some(action);
+        #[cfg(feature = "ui-demo")]
+        {
+            match action {
+                crate::core::ui::UiAction::Clicked(1) => {
+                    self.demo_click_count = self.demo_click_count.saturating_add(1);
+                    self.dirty = true;
+                }
+                crate::core::ui::UiAction::Clicked(id) if (100..=119).contains(&id) => {
+                    self.demo_selected_row = Some(id);
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Renders the notch shape into the local DIB pixel buffer.
@@ -551,54 +569,61 @@ impl NotchWindowState {
             );
         }
 
-        // 2. Open state content: large clock + date
+        // 2. Open state content: large clock + date (or interactive demo page if ui-demo feature enabled)
         if open_alpha > 0.001 {
-            let clock_str =
-                i18n::format_time(self.time_format, self.current_hour, self.current_minute);
-            let font_size_clock = (layout::OPEN_CLOCK_FONT_SIZE * self.scale).round() as u32;
-            let clock_w = self
-                .font_renderer
-                .measure_text_width(&clock_str, font_size_clock, true);
+            #[cfg(feature = "ui-demo")]
+            {
+                self.render_ui_demo(open_alpha);
+            }
+            #[cfg(not(feature = "ui-demo"))]
+            {
+                let clock_str =
+                    i18n::format_time(self.time_format, self.current_hour, self.current_minute);
+                let font_size_clock = (layout::OPEN_CLOCK_FONT_SIZE * self.scale).round() as u32;
+                let clock_w =
+                    self.font_renderer
+                        .measure_text_width(&clock_str, font_size_clock, true);
 
-            let clock_x = geom.x + (geom.width - clock_w) / 2.0;
-            let clock_y = geom.y + (48.0 * self.scale).round();
+                let clock_x = geom.x + (geom.width - clock_w) / 2.0;
+                let clock_y = geom.y + (48.0 * self.scale).round();
 
-            self.font_renderer.draw_text(
-                &mut self.pixmap.as_mut(),
-                &clock_str,
-                clock_x,
-                clock_y,
-                font_size_clock,
-                (255, 255, 255),
-                open_alpha,
-                true,
-            );
+                self.font_renderer.draw_text(
+                    &mut self.pixmap.as_mut(),
+                    &clock_str,
+                    clock_x,
+                    clock_y,
+                    font_size_clock,
+                    (255, 255, 255),
+                    open_alpha,
+                    true,
+                );
 
-            let date_str = i18n::format_date(
-                self.language,
-                self.current_day_of_week,
-                self.current_day,
-                self.current_month,
-                self.current_year,
-            );
-            let font_size_date = (layout::OPEN_DATE_FONT_SIZE * self.scale).round() as u32;
-            let date_w = self
-                .font_renderer
-                .measure_text_width(&date_str, font_size_date, false);
+                let date_str = i18n::format_date(
+                    self.language,
+                    self.current_day_of_week,
+                    self.current_day,
+                    self.current_month,
+                    self.current_year,
+                );
+                let font_size_date = (layout::OPEN_DATE_FONT_SIZE * self.scale).round() as u32;
+                let date_w =
+                    self.font_renderer
+                        .measure_text_width(&date_str, font_size_date, false);
 
-            let date_x = geom.x + (geom.width - date_w) / 2.0;
-            let date_y = geom.y + (74.0 * self.scale).round();
+                let date_x = geom.x + (geom.width - date_w) / 2.0;
+                let date_y = geom.y + (74.0 * self.scale).round();
 
-            self.font_renderer.draw_text(
-                &mut self.pixmap.as_mut(),
-                &date_str,
-                date_x,
-                date_y,
-                font_size_date,
-                (170, 170, 175), // #AAAAAF
-                open_alpha,
-                false,
-            );
+                self.font_renderer.draw_text(
+                    &mut self.pixmap.as_mut(),
+                    &date_str,
+                    date_x,
+                    date_y,
+                    font_size_date,
+                    (170, 170, 175), // #AAAAAF
+                    open_alpha,
+                    false,
+                );
+            }
         }
 
         let src = self.pixmap.data();
@@ -608,6 +633,272 @@ impl NotchWindowState {
 
         self.dirty = false;
         Ok(())
+    }
+
+    #[cfg(feature = "ui-demo")]
+    fn draw_rounded_rect(
+        pixmap: &mut tiny_skia::PixmapMut,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        color: (u8, u8, u8, u8),
+    ) {
+        use tiny_skia::{FillRule, Paint, PathBuilder, Transform};
+        let mut pb = PathBuilder::new();
+        let r = r.min(w / 2.0).min(h / 2.0);
+        pb.move_to(x + r, y);
+        pb.line_to(x + w - r, y);
+        pb.cubic_to(
+            x + w - r + r * crate::core::renderer::KAPPA,
+            y,
+            x + w,
+            y + r - r * crate::core::renderer::KAPPA,
+            x + w,
+            y + r,
+        );
+        pb.line_to(x + w, y + h - r);
+        pb.cubic_to(
+            x + w,
+            y + h - r + r * crate::core::renderer::KAPPA,
+            x + w - r + r * crate::core::renderer::KAPPA,
+            y + h,
+            x + w - r,
+            y + h,
+        );
+        pb.line_to(x + r, y + h);
+        pb.cubic_to(
+            x + r - r * crate::core::renderer::KAPPA,
+            y + h,
+            x,
+            y + h - r + r * crate::core::renderer::KAPPA,
+            x,
+            y + h - r,
+        );
+        pb.line_to(x, y + r);
+        pb.cubic_to(
+            x,
+            y + r - r * crate::core::renderer::KAPPA,
+            x + r - r * crate::core::renderer::KAPPA,
+            y,
+            x + r,
+            y,
+        );
+        pb.close();
+
+        if let Some(path) = pb.finish() {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(color.0, color.1, color.2, color.3);
+            paint.anti_alias = true;
+            pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    #[cfg(feature = "ui-demo")]
+    fn draw_rect(
+        pixmap: &mut tiny_skia::PixmapMut,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: (u8, u8, u8, u8),
+    ) {
+        if let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color_rgba8(color.0, color.1, color.2, color.3);
+            pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+        }
+    }
+
+    /// Renders the interactive UI demo page (behind the `ui-demo` feature gate).
+    #[cfg(feature = "ui-demo")]
+    pub fn render_ui_demo(&mut self, open_alpha: f32) {
+        self.ui.clear_widgets();
+        let scale = self.scale;
+
+        // 1. Counter text
+        let counter_str = format!("Klik: {}", self.demo_click_count);
+        let font_size_counter = (12.0 * scale).round() as u32;
+        let counter_x = (36.0 * scale).round();
+        let counter_y = (24.0 * scale).round();
+        self.font_renderer.draw_text(
+            &mut self.pixmap.as_mut(),
+            &counter_str,
+            counter_x,
+            counter_y,
+            font_size_counter,
+            (220, 220, 225),
+            open_alpha,
+            true,
+        );
+
+        // 2. Active Button (ID 1)
+        let btn1_rect = crate::core::ui::Rect::new(36.0, 32.0, 105.0, 30.0);
+        self.ui.add_widget(crate::core::ui::Widget::new(
+            1,
+            btn1_rect,
+            crate::core::ui::WidgetKind::Button,
+            true,
+        ));
+        let btn1_state = self.ui.button_state(1);
+        let (btn1_bg, btn1_text_color) = match btn1_state {
+            crate::core::ui::ButtonVisualState::Normal => {
+                ((255, 255, 255, (35.0 * open_alpha) as u8), (240, 240, 240))
+            }
+            crate::core::ui::ButtonVisualState::Hover => {
+                ((255, 255, 255, (65.0 * open_alpha) as u8), (255, 255, 255))
+            }
+            crate::core::ui::ButtonVisualState::Pressed => {
+                ((255, 255, 255, (110.0 * open_alpha) as u8), (255, 255, 255))
+            }
+            crate::core::ui::ButtonVisualState::Disabled => {
+                ((255, 255, 255, (15.0 * open_alpha) as u8), (140, 140, 145))
+            }
+        };
+        Self::draw_rounded_rect(
+            &mut self.pixmap.as_mut(),
+            (btn1_rect.x * scale).round(),
+            (btn1_rect.y * scale).round(),
+            (btn1_rect.width * scale).round(),
+            (btn1_rect.height * scale).round(),
+            (6.0 * scale).round(),
+            btn1_bg,
+        );
+        let btn_font_size = (12.0 * scale).round() as u32;
+        let label1 = "Klik Saya";
+        let text1_w = self
+            .font_renderer
+            .measure_text_width(label1, btn_font_size, false);
+        let text1_x =
+            (btn1_rect.x * scale).round() + ((btn1_rect.width * scale).round() - text1_w) / 2.0;
+        let text1_y = (btn1_rect.y * scale).round() + (20.0 * scale).round();
+        self.font_renderer.draw_text(
+            &mut self.pixmap.as_mut(),
+            label1,
+            text1_x,
+            text1_y,
+            btn_font_size,
+            btn1_text_color,
+            open_alpha,
+            false,
+        );
+
+        // 3. Disabled Button (ID 2)
+        let btn2_rect = crate::core::ui::Rect::new(36.0, 70.0, 105.0, 30.0);
+        self.ui.add_widget(crate::core::ui::Widget::new(
+            2,
+            btn2_rect,
+            crate::core::ui::WidgetKind::Button,
+            false,
+        ));
+        Self::draw_rounded_rect(
+            &mut self.pixmap.as_mut(),
+            (btn2_rect.x * scale).round(),
+            (btn2_rect.y * scale).round(),
+            (btn2_rect.width * scale).round(),
+            (btn2_rect.height * scale).round(),
+            (6.0 * scale).round(),
+            (255, 255, 255, (15.0 * open_alpha) as u8),
+        );
+        let label2 = "Nonaktif";
+        let text2_w = self
+            .font_renderer
+            .measure_text_width(label2, btn_font_size, false);
+        let text2_x =
+            (btn2_rect.x * scale).round() + ((btn2_rect.width * scale).round() - text2_w) / 2.0;
+        let text2_y = (btn2_rect.y * scale).round() + (20.0 * scale).round();
+        self.font_renderer.draw_text(
+            &mut self.pixmap.as_mut(),
+            label2,
+            text2_x,
+            text2_y,
+            btn_font_size,
+            (140, 140, 145),
+            open_alpha * 0.6,
+            false,
+        );
+
+        // Divider
+        Self::draw_rect(
+            &mut self.pixmap.as_mut(),
+            (152.0 * scale).round(),
+            (15.0 * scale).round(),
+            (1.0 * scale).round().max(1.0),
+            (85.0 * scale).round(),
+            (255, 255, 255, (25.0 * open_alpha) as u8),
+        );
+
+        // 4. Scrollable List of 20 items (IDs 100..119)
+        let list_visible_height = 84.0;
+        let total_content_height = 20.0 * 20.0;
+        self.ui
+            .set_scroll_bounds(total_content_height, list_visible_height);
+        let scroll = self.ui.scroll_offset();
+
+        let row_h = 20.0;
+        for i in 0..20 {
+            let row_id = 100 + i as u32;
+            let row_y = 15.0 + (i as f32 * row_h) - scroll;
+            if row_y + row_h >= 15.0 && row_y <= 100.0 {
+                let row_rect = crate::core::ui::Rect::new(160.0, row_y, 195.0, 18.0);
+                self.ui.add_widget(crate::core::ui::Widget::new(
+                    row_id,
+                    row_rect,
+                    crate::core::ui::WidgetKind::ListRow,
+                    true,
+                ));
+
+                let is_selected = self.demo_selected_row == Some(row_id);
+                let is_hovered =
+                    self.ui.button_state(row_id) == crate::core::ui::ButtonVisualState::Hover;
+
+                let row_bg = if is_selected {
+                    Some((60, 130, 240, (180.0 * open_alpha) as u8))
+                } else if is_hovered {
+                    Some((255, 255, 255, (30.0 * open_alpha) as u8))
+                } else {
+                    None
+                };
+
+                if let Some(bg) = row_bg {
+                    Self::draw_rounded_rect(
+                        &mut self.pixmap.as_mut(),
+                        (row_rect.x * scale).round(),
+                        (row_rect.y * scale).round(),
+                        (row_rect.width * scale).round(),
+                        (row_rect.height * scale).round(),
+                        (4.0 * scale).round(),
+                        bg,
+                    );
+                }
+
+                let row_text = format!("Item {}", i + 1);
+                let row_font_size = (11.0 * scale).round() as u32;
+                let text_x = (row_rect.x * scale).round() + (8.0 * scale).round();
+                let text_y = (row_rect.y * scale).round() + (13.0 * scale).round();
+                self.font_renderer.draw_text(
+                    &mut self.pixmap.as_mut(),
+                    &row_text,
+                    text_x,
+                    text_y,
+                    row_font_size,
+                    if is_selected {
+                        (255, 255, 255)
+                    } else {
+                        (200, 200, 205)
+                    },
+                    open_alpha,
+                    false,
+                );
+            }
+        }
     }
 
     /// Kicks the animation pacing mechanism (DWM VSync thread with SetTimer fallback).
@@ -921,6 +1212,10 @@ impl NotchWindow {
             close_delay_ms,
             ui: crate::core::ui::UiContext::new(),
             last_action: None,
+            #[cfg(feature = "ui-demo")]
+            demo_click_count: 0,
+            #[cfg(feature = "ui-demo")]
+            demo_selected_row: None,
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
             #[cfg(debug_assertions)]
@@ -2802,7 +3097,9 @@ mod tests {
 
     #[test]
     fn test_synthetic_button_click_triggers_action() {
-        use crate::core::ui::{Rect, UiAction, Widget, WidgetKind};
+        use crate::core::ui::UiAction;
+        #[cfg(not(feature = "ui-demo"))]
+        use crate::core::ui::{Rect, Widget, WidgetKind};
 
         let _dpi = set_dpi_awareness_v2();
         let notch = NotchWindow::create().expect("Failed to create notch window for click test");
@@ -2810,24 +3107,36 @@ mod tests {
         let raw_cell =
             unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
 
-        // Force motion to fully open state so can_interact is true
-        unsafe {
+        let (target_id, phys_x, phys_y) = unsafe {
             with_state(raw_cell, |s| {
                 s.motion.reset(1.0);
                 s.animating = false;
-                s.ui.clear_widgets();
-                s.ui.add_widget(Widget::new(
-                    101,
-                    Rect::new(0.0, 0.0, 200.0, 100.0),
-                    WidgetKind::Button,
-                    true,
-                ));
                 s.last_action = None;
-            });
-        }
+                #[cfg(feature = "ui-demo")]
+                {
+                    s.dirty = true;
+                    let _ = s.render_buffer();
+                    let px = (50.0 * s.scale).round() as i32;
+                    let py = (45.0 * s.scale).round() as i32;
+                    (1, px, py)
+                }
+                #[cfg(not(feature = "ui-demo"))]
+                {
+                    s.ui.clear_widgets();
+                    s.ui.add_widget(Widget::new(
+                        101,
+                        Rect::new(0.0, 0.0, 200.0, 100.0),
+                        WidgetKind::Button,
+                        true,
+                    ));
+                    (101, 30, 30)
+                }
+            })
+            .unwrap()
+        };
 
-        // Mouse down at (30, 30)
-        let lp_inside = LPARAM(((30u32 << 16) | (30u32 & 0xFFFF)) as isize);
+        // Mouse down at inside target
+        let lp_inside = LPARAM(((phys_y as u32) << 16 | (phys_x as u32 & 0xFFFF)) as isize);
         unsafe {
             let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_inside);
         }
@@ -2836,13 +3145,13 @@ mod tests {
             with_state(raw_cell, |s| {
                 assert_eq!(
                     s.ui.pressed_widget(),
-                    Some(101),
-                    "Widget 101 should be in pressed state after mouse down"
+                    Some(target_id),
+                    "Target widget should be in pressed state after mouse down"
                 );
             });
         }
 
-        // Mouse up at (30, 30) inside the button
+        // Mouse up at inside target
         unsafe {
             let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_inside);
         }
@@ -2851,8 +3160,8 @@ mod tests {
             with_state(raw_cell, |s| {
                 assert_eq!(
                     s.last_action,
-                    Some(UiAction::Clicked(101)),
-                    "Releasing inside button 101 must dispatch UiAction::Clicked(101)"
+                    Some(UiAction::Clicked(target_id)),
+                    "Releasing inside button must dispatch UiAction::Clicked"
                 );
             });
         }
@@ -2861,6 +3170,7 @@ mod tests {
 
     #[test]
     fn test_synthetic_drag_out_cancels_action() {
+        #[cfg(not(feature = "ui-demo"))]
         use crate::core::ui::{Rect, Widget, WidgetKind};
 
         let _dpi = set_dpi_awareness_v2();
@@ -2870,23 +3180,36 @@ mod tests {
             unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
 
         // Force motion to fully open state
-        unsafe {
+        let (phys_x, phys_y) = unsafe {
             with_state(raw_cell, |s| {
                 s.motion.reset(1.0);
                 s.animating = false;
-                s.ui.clear_widgets();
-                s.ui.add_widget(Widget::new(
-                    102,
-                    Rect::new(10.0, 10.0, 40.0, 20.0),
-                    WidgetKind::Button,
-                    true,
-                ));
                 s.last_action = None;
-            });
-        }
+                #[cfg(feature = "ui-demo")]
+                {
+                    s.dirty = true;
+                    let _ = s.render_buffer();
+                    let px = (50.0 * s.scale).round() as i32;
+                    let py = (45.0 * s.scale).round() as i32;
+                    (px, py)
+                }
+                #[cfg(not(feature = "ui-demo"))]
+                {
+                    s.ui.clear_widgets();
+                    s.ui.add_widget(Widget::new(
+                        102,
+                        Rect::new(10.0, 10.0, 40.0, 20.0),
+                        WidgetKind::Button,
+                        true,
+                    ));
+                    (20, 20)
+                }
+            })
+            .unwrap()
+        };
 
-        // Mouse down inside button at (20, 20)
-        let lp_inside = LPARAM(((20u32 << 16) | (20u32 & 0xFFFF)) as isize);
+        // Mouse down inside button
+        let lp_inside = LPARAM(((phys_y as u32) << 16 | (phys_x as u32 & 0xFFFF)) as isize);
         unsafe {
             let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_inside);
         }
@@ -2929,5 +3252,102 @@ mod tests {
             });
         }
         println!("[E4 IDLE_TIMERS] Verified zero animation timers/threads active during idle");
+    }
+
+    #[cfg(feature = "ui-demo")]
+    #[test]
+    fn test_ui_demo_interaction_flow() {
+        use crate::core::ui::UiAction;
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for demo test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Force open state and render demo buffer
+        let scale = unsafe {
+            with_state(raw_cell, |s| {
+                s.motion.reset(1.0);
+                s.animating = false;
+                s.dirty = true;
+                let _ = s.render_buffer();
+                assert!(
+                    s.ui.widget_count() >= 3,
+                    "Demo UI must register at least button 1, button 2, and list rows"
+                );
+                s.scale
+            })
+            .unwrap()
+        };
+
+        // 1. Click Button 1 (Active Button at logical 36, 32)
+        let phys_x = (50.0 * scale).round() as i32;
+        let phys_y = (45.0 * scale).round() as i32;
+        let lp_btn1 = LPARAM(((phys_y as u32) << 16 | (phys_x as u32 & 0xFFFF)) as isize);
+
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_btn1);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_btn1);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(
+                    s.last_action,
+                    Some(UiAction::Clicked(1)),
+                    "Clicking button 1 must dispatch UiAction::Clicked(1)"
+                );
+                assert_eq!(
+                    s.demo_click_count, 1,
+                    "Clicking button 1 must increment demo_click_count"
+                );
+            });
+        }
+
+        // 2. Click List Row 100 (at logical 180, 20)
+        let row_phys_x = (180.0 * scale).round() as i32;
+        let row_phys_y = (20.0 * scale).round() as i32;
+        let lp_row = LPARAM(((row_phys_y as u32) << 16 | (row_phys_x as u32 & 0xFFFF)) as isize);
+
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_row);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_row);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(
+                    s.demo_selected_row,
+                    Some(100),
+                    "Clicking row 100 must select row 100 in demo_selected_row"
+                );
+            });
+        }
+
+        // 3. Click Disabled Button 2 (at logical 36, 70)
+        let dis_phys_x = (50.0 * scale).round() as i32;
+        let dis_phys_y = (80.0 * scale).round() as i32;
+        let lp_btn2 = LPARAM(((dis_phys_y as u32) << 16 | (dis_phys_x as u32 & 0xFFFF)) as isize);
+
+        unsafe {
+            with_state(raw_cell, |s| s.last_action = None);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_btn2);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_btn2);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(
+                    s.last_action.is_none(),
+                    "Disabled button 2 must ignore clicks and dispatch no action"
+                );
+                assert_eq!(s.demo_click_count, 1, "Counter must remain unchanged");
+            });
+        }
+
+        println!(
+            "[F1 UI_DEMO] Successfully verified button clicks, counter increments, and row selection"
+        );
     }
 }
