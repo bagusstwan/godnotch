@@ -34,8 +34,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SW_SHOWNOACTIVATE,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_MOUSEMOVE,
-    WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED,
+    WM_MOUSEMOVE, WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, PCWSTR, Result, w};
@@ -328,6 +328,8 @@ pub struct NotchWindowState {
 
     pub is_tracking_leave: bool,
     pub pacer: DwmPacer,
+    pub tray: Option<crate::platform::tray::TrayIcon>,
+    pub taskbar_created_msg: u32,
     #[cfg(debug_assertions)]
     pub debug_timer_stats: DebugTimerStats,
     #[cfg(debug_assertions)]
@@ -703,6 +705,16 @@ impl NotchWindow {
         let font_renderer = FontRenderer::new();
         let font_init_profile = font_renderer.profile;
 
+        let tray = match crate::platform::tray::TrayIcon::create(hwnd) {
+            Ok(t) => Some(t),
+            Err(_e) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[godnotch] Failed to create tray icon: {_e:?}");
+                None
+            }
+        };
+        let taskbar_created_msg = tray.as_ref().map_or(0, |t| t.taskbar_created_msg());
+
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
             mem_dc,
@@ -728,6 +740,8 @@ impl NotchWindow {
             current_year: st.wYear,
             is_tracking_leave: false,
             pacer: DwmPacer::new(),
+            tray,
+            taskbar_created_msg,
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
             #[cfg(debug_assertions)]
@@ -1144,11 +1158,46 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             LRESULT(0)
         }
 
+        crate::platform::tray::WM_APP_TRAY => {
+            let event = (lp.0 & 0xFFFF) as u32;
+            if event == WM_CONTEXTMENU || event == WM_RBUTTONUP {
+                // Read current state outside of the popup menu modal loop
+                let (is_autostart, lang) = unsafe {
+                    with_state(raw_cell, |state| {
+                        (
+                            crate::platform::autostart::is_autostart_enabled(),
+                            state.language,
+                        )
+                    })
+                }
+                .unwrap_or((false, Language::Indonesian));
+
+                let cmd = crate::platform::tray::show_context_menu(hwnd, None, is_autostart, lang);
+                if let Some(cmd) = cmd {
+                    match cmd {
+                        crate::platform::tray::TrayMenuCommand::ToggleAutostart => {
+                            let _ = crate::platform::autostart::toggle_autostart();
+                        }
+                        crate::platform::tray::TrayMenuCommand::Exit => {
+                            // SAFETY: Destroying window upon user exit request from tray menu.
+                            unsafe {
+                                let _ = DestroyWindow(hwnd);
+                            }
+                        }
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
         WM_DESTROY => {
-            // SAFETY: Stopping pacer thread, terminating timers, and posting quit message.
+            // SAFETY: Stopping pacer thread, removing tray icon, terminating timers, and posting quit message.
             unsafe {
                 with_state(raw_cell, |state| {
                     state.pacer.stop();
+                    if let Some(mut tray) = state.tray.take() {
+                        tray.remove();
+                    }
                 });
                 let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
                 let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
@@ -1170,7 +1219,28 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
         }
 
-        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+        _ => {
+            let is_taskbar_created = unsafe {
+                with_state(raw_cell, |state| {
+                    state.taskbar_created_msg == msg && msg != 0
+                })
+            }
+            .unwrap_or(false);
+
+            if is_taskbar_created {
+                unsafe {
+                    with_state(raw_cell, |state| {
+                        if let Some(ref mut tray) = state.tray {
+                            tray.handle_taskbar_created();
+                        }
+                    });
+                }
+                return LRESULT(0);
+            }
+
+            // SAFETY: Default window procedure for unhandled messages.
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
     }
 }
 
