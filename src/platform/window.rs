@@ -45,19 +45,19 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 /// Custom message posted by the DWM VSync pacer thread to drive UI animation frames.
 pub const WM_APP_FRAME: u32 = WM_APP + 1;
 
+use crate::core::config::{LanguageConfig, Settings, TimeFormatConfig};
 use crate::core::i18n::{self, Language, TimeFormat};
 use crate::core::layout;
 use crate::core::motion::{Motion, MotionDirection};
 use crate::core::renderer;
 use crate::core::text::FontRenderer;
+use crate::platform::storage::SettingsStorage;
 
 const TIMER_OPEN_DELAY: usize = 101;
 const TIMER_CLOSE_DELAY: usize = 102;
 const TIMER_ANIM: usize = 103;
 const TIMER_MINUTE_CLOCK: usize = 104;
 
-const OPEN_DELAY_MS: u32 = 80;
-const CLOSE_DELAY_MS: u32 = 300;
 const ANIM_FRAME_MS: u32 = 16;
 
 /// Configures process-wide DPI awareness to Per-Monitor V2.
@@ -332,6 +332,10 @@ pub struct NotchWindowState {
     pub is_hidden_by_fullscreen: bool,
     pub notch_monitor_rect: crate::core::fullscreen::Rect,
     pub watcher: Option<crate::platform::fullscreen::FullscreenWatcher>,
+    pub storage: SettingsStorage,
+    pub settings: Settings,
+    pub open_delay_ms: u32,
+    pub close_delay_ms: u32,
     #[cfg(debug_assertions)]
     pub debug_timer_stats: DebugTimerStats,
     #[cfg(debug_assertions)]
@@ -441,6 +445,56 @@ impl NotchWindowState {
             self.dirty = true;
         }
         changed
+    }
+
+    /// Reloads settings from disk via `storage` and applies them immediately.
+    pub fn reload_settings(&mut self, hwnd: HWND) {
+        let (new_settings, _outcome) = self.storage.load();
+        self.apply_settings(hwnd, new_settings);
+    }
+
+    /// Applies new settings to the active window state, updating language, time format,
+    /// hover delays, and starting/stopping the fullscreen watcher.
+    pub fn apply_settings(&mut self, hwnd: HWND, new_settings: Settings) {
+        self.settings = new_settings;
+        self.language = match self.settings.language {
+            LanguageConfig::Auto => query_user_locale_language(),
+            LanguageConfig::Id => Language::Indonesian,
+            LanguageConfig::En => Language::English,
+        };
+        self.time_format = match self.settings.time_format {
+            TimeFormatConfig::Auto => query_system_time_format(),
+            TimeFormatConfig::Hour12 => TimeFormat::Hour12,
+            TimeFormatConfig::Hour24 => TimeFormat::Hour24,
+        };
+        self.open_delay_ms = self.settings.open_delay_ms;
+        self.close_delay_ms = self.settings.close_delay_ms;
+
+        if self.settings.hide_on_fullscreen {
+            if self.watcher.is_none() {
+                self.watcher = Some(crate::platform::fullscreen::FullscreenWatcher::start(hwnd));
+            }
+            if let Some(ref mut watcher) = self.watcher {
+                let should_hide = watcher.check_fullscreen(self.notch_monitor_rect);
+                if should_hide && !self.is_hidden_by_fullscreen {
+                    self.hide_for_fullscreen(hwnd);
+                } else if !should_hide && self.is_hidden_by_fullscreen {
+                    self.restore_from_fullscreen(hwnd);
+                }
+            }
+        } else {
+            if let Some(mut watcher) = self.watcher.take() {
+                watcher.stop();
+            }
+            if self.is_hidden_by_fullscreen {
+                self.restore_from_fullscreen(hwnd);
+            }
+        }
+
+        if !self.is_hidden_by_fullscreen && !self.animating {
+            self.dirty = true;
+            let _ = self.render_buffer();
+        }
     }
 
     /// Renders the notch shape into the local DIB pixel buffer.
@@ -676,8 +730,15 @@ pub struct NotchWindow {
 }
 
 impl NotchWindow {
-    /// Creates and shows the layered notch window.
+    /// Creates and shows the layered notch window using default settings storage.
     pub fn create() -> Result<Self> {
+        let storage = SettingsStorage::new_default()
+            .unwrap_or_else(|| SettingsStorage::new_custom(std::env::temp_dir().join("godnotch")));
+        Self::create_with_storage(storage)
+    }
+
+    /// Creates and shows the layered notch window with custom settings storage.
+    pub fn create_with_storage(storage: SettingsStorage) -> Result<Self> {
         let t_start = Instant::now();
 
         // Phase 1: Window & DC Creation
@@ -772,8 +833,19 @@ impl NotchWindow {
         // Phase 2: Font initialization & glyph caching
         // SAFETY: Querying current local system time.
         let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-        let time_format = query_system_time_format();
-        let language = query_user_locale_language();
+        let (settings, _outcome) = storage.load();
+        let time_format = match settings.time_format {
+            TimeFormatConfig::Auto => query_system_time_format(),
+            TimeFormatConfig::Hour12 => TimeFormat::Hour12,
+            TimeFormatConfig::Hour24 => TimeFormat::Hour24,
+        };
+        let language = match settings.language {
+            LanguageConfig::Auto => query_user_locale_language(),
+            LanguageConfig::Id => Language::Indonesian,
+            LanguageConfig::En => Language::English,
+        };
+        let open_delay_ms = settings.open_delay_ms;
+        let close_delay_ms = settings.close_delay_ms;
         let font_renderer = FontRenderer::new();
         let font_init_profile = font_renderer.profile;
 
@@ -793,8 +865,14 @@ impl NotchWindow {
                 let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
                 crate::core::fullscreen::Rect::new(0, 0, screen_w, screen_h)
             });
-        let mut watcher = crate::platform::fullscreen::FullscreenWatcher::start(hwnd);
-        let is_initially_fullscreen = watcher.check_fullscreen(notch_monitor_rect);
+
+        let (watcher_opt, is_initially_fullscreen) = if settings.hide_on_fullscreen {
+            let mut watcher = crate::platform::fullscreen::FullscreenWatcher::start(hwnd);
+            let is_full = watcher.check_fullscreen(notch_monitor_rect);
+            (Some(watcher), is_full)
+        } else {
+            (None, false)
+        };
 
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
@@ -825,7 +903,11 @@ impl NotchWindow {
             taskbar_created_msg,
             is_hidden_by_fullscreen: is_initially_fullscreen,
             notch_monitor_rect,
-            watcher: Some(watcher),
+            watcher: watcher_opt,
+            storage,
+            settings,
+            open_delay_ms,
+            close_delay_ms,
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
             #[cfg(debug_assertions)]
@@ -925,10 +1007,12 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
             let mut start_tracking = false;
             let mut immediate_open = false;
+            let mut open_delay = 80u32;
 
             // SAFETY: raw_cell points to a valid RefCell<NotchWindowState> associated with hwnd.
             unsafe {
                 with_state(raw_cell, |state| {
+                    open_delay = state.open_delay_ms;
                     if !state.is_tracking_leave {
                         state.is_tracking_leave = true;
                         start_tracking = true;
@@ -956,16 +1040,19 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
                 }
 
-                if immediate_open {
+                if immediate_open || open_delay == 0 {
                     // SAFETY: raw_cell is valid; kicking animation timer.
                     unsafe {
-                        with_state(raw_cell, |state| state.kick_anim(hwnd));
+                        with_state(raw_cell, |state| {
+                            state.motion.open();
+                            state.kick_anim(hwnd);
+                        });
                     }
                 } else {
-                    // Closed state: start 80ms open delay timer (one-shot)
+                    // Closed state: start open delay timer (one-shot)
                     // SAFETY: Starting open delay timer.
                     unsafe {
-                        SetTimer(hwnd, TIMER_OPEN_DELAY, OPEN_DELAY_MS, None);
+                        SetTimer(hwnd, TIMER_OPEN_DELAY, open_delay, None);
                     }
                 }
             }
@@ -973,18 +1060,20 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSELEAVE => {
-            // SAFETY: raw_cell is valid; resetting leave tracking state.
-            unsafe {
+            // SAFETY: raw_cell is valid; resetting leave tracking state and retrieving close delay.
+            let close_delay = unsafe {
                 with_state(raw_cell, |state| {
                     state.is_tracking_leave = false;
-                });
+                    state.close_delay_ms
+                })
             }
+            .unwrap_or(300);
 
-            // Cancel pending open delay if cursor left before 80ms elapsed, and start 300ms close delay
+            // Cancel pending open delay if cursor left before delay elapsed, and start close delay
             // SAFETY: Canceling open delay timer and starting close delay timer.
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
-                SetTimer(hwnd, TIMER_CLOSE_DELAY, CLOSE_DELAY_MS, None);
+                SetTimer(hwnd, TIMER_CLOSE_DELAY, close_delay, None);
             }
             LRESULT(0)
         }
@@ -1250,8 +1339,6 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
             // SAFETY: Querying current system time after time change event.
             let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-            let time_format = query_system_time_format();
-            let language = query_user_locale_language();
             let next_delay =
                 layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
             // SAFETY: Arming new one-shot timer aligned to the new minute boundary.
@@ -1262,8 +1349,16 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             // SAFETY: Updating cached format/locale/time and redrawing if not animating.
             let render_res = unsafe {
                 with_state(raw_cell, |state| {
-                    state.time_format = time_format;
-                    state.language = language;
+                    state.time_format = match state.settings.time_format {
+                        TimeFormatConfig::Auto => query_system_time_format(),
+                        TimeFormatConfig::Hour12 => TimeFormat::Hour12,
+                        TimeFormatConfig::Hour24 => TimeFormat::Hour24,
+                    };
+                    state.language = match state.settings.language {
+                        LanguageConfig::Auto => query_user_locale_language(),
+                        LanguageConfig::Id => Language::Indonesian,
+                        LanguageConfig::En => Language::English,
+                    };
                     state.update_time(&st);
                     if !state.animating && !state.is_hidden_by_fullscreen {
                         state.dirty = true;
@@ -1288,26 +1383,115 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let event = (lp.0 & 0xFFFF) as u32;
             if event == WM_CONTEXTMENU || event == WM_RBUTTONUP {
                 // Read current state outside of the popup menu modal loop
-                let (is_autostart, lang) = unsafe {
+                let state_info = unsafe {
                     with_state(raw_cell, |state| {
                         (
                             crate::platform::autostart::is_autostart_enabled(),
+                            state.settings.hide_on_fullscreen,
                             state.language,
                         )
                     })
-                }
-                .unwrap_or((false, Language::Indonesian));
+                };
 
-                let cmd = crate::platform::tray::show_context_menu(hwnd, None, is_autostart, lang);
-                if let Some(cmd) = cmd {
-                    match cmd {
-                        crate::platform::tray::TrayMenuCommand::ToggleAutostart => {
-                            let _ = crate::platform::autostart::toggle_autostart();
-                        }
-                        crate::platform::tray::TrayMenuCommand::Exit => {
-                            // SAFETY: Destroying window upon user exit request from tray menu.
-                            unsafe {
-                                let _ = DestroyWindow(hwnd);
+                if let Some((is_autostart, hide_on_fullscreen, lang)) = state_info {
+                    let cmd = crate::platform::tray::show_context_menu(
+                        hwnd,
+                        None,
+                        is_autostart,
+                        hide_on_fullscreen,
+                        lang,
+                    );
+                    if let Some(cmd) = cmd {
+                        match cmd {
+                            crate::platform::tray::TrayMenuCommand::ToggleAutostart => {
+                                let _ = crate::platform::autostart::toggle_autostart();
+                            }
+                            crate::platform::tray::TrayMenuCommand::ToggleHideOnFullscreen => {
+                                let present_res = unsafe {
+                                    with_state(raw_cell, |state| {
+                                        let mut new_settings = state.settings.clone();
+                                        new_settings.hide_on_fullscreen =
+                                            !new_settings.hide_on_fullscreen;
+                                        let _ = state.storage.save(&new_settings);
+                                        state.apply_settings(hwnd, new_settings);
+                                        if !state.is_hidden_by_fullscreen && !state.animating {
+                                            Some((
+                                                state.mem_dc,
+                                                state.screen_w,
+                                                state.canvas_w,
+                                                state.canvas_h,
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                };
+                                if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) =
+                                    present_res
+                                {
+                                    // SAFETY: Presenting window without holding state borrow.
+                                    unsafe {
+                                        let _ = present_layered_window(
+                                            hwnd, mem_dc, screen_w, canvas_w, canvas_h,
+                                        );
+                                    }
+                                }
+                            }
+                            crate::platform::tray::TrayMenuCommand::OpenSettingsFile => {
+                                let path_res = unsafe {
+                                    with_state(raw_cell, |state| {
+                                        state.storage.ensure_file_exists(&state.settings)
+                                    })
+                                };
+                                if let Some(Ok(path)) = path_res {
+                                    use std::os::windows::ffi::OsStrExt;
+                                    let wide_path: Vec<u16> =
+                                        path.as_os_str().encode_wide().chain(Some(0)).collect();
+                                    // SAFETY: Launching default editor for settings.json via ShellExecuteW.
+                                    unsafe {
+                                        let _ = windows::Win32::UI::Shell::ShellExecuteW(
+                                            HWND::default(),
+                                            windows::core::w!("open"),
+                                            windows::core::PCWSTR::from_raw(wide_path.as_ptr()),
+                                            windows::core::PCWSTR::null(),
+                                            windows::core::PCWSTR::null(),
+                                            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+                                        );
+                                    }
+                                }
+                            }
+                            crate::platform::tray::TrayMenuCommand::ReloadSettings => {
+                                let present_res = unsafe {
+                                    with_state(raw_cell, |state| {
+                                        state.reload_settings(hwnd);
+                                        if !state.is_hidden_by_fullscreen && !state.animating {
+                                            Some((
+                                                state.mem_dc,
+                                                state.screen_w,
+                                                state.canvas_w,
+                                                state.canvas_h,
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                };
+                                if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) =
+                                    present_res
+                                {
+                                    // SAFETY: Presenting window without holding state borrow.
+                                    unsafe {
+                                        let _ = present_layered_window(
+                                            hwnd, mem_dc, screen_w, canvas_w, canvas_h,
+                                        );
+                                    }
+                                }
+                            }
+                            crate::platform::tray::TrayMenuCommand::Exit => {
+                                // SAFETY: Destroying window upon user exit request from tray menu.
+                                unsafe {
+                                    let _ = DestroyWindow(hwnd);
+                                }
                             }
                         }
                     }
@@ -2242,5 +2426,123 @@ mod tests {
         println!(
             "[C3 DEBOUNCE_LIFECYCLE] Successfully debounced and evaluated fullscreen check via message pump"
         );
+    }
+
+    #[test]
+    fn test_settings_live_reload_and_apply() {
+        let _dpi = set_dpi_awareness_v2();
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!("godnotch_test_reload_{unique_id}"));
+        let storage = SettingsStorage::new_custom(test_dir.clone());
+
+        let notch = NotchWindow::create_with_storage(storage.clone())
+            .expect("Failed to create notch window for live reload test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Verify initial defaults
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(s.open_delay_ms, 80);
+                assert_eq!(s.close_delay_ms, 300);
+                assert!(s.settings.hide_on_fullscreen);
+                assert!(s.watcher.is_some());
+            });
+        }
+
+        // Write custom settings to disk
+        let custom_json = r#"{
+            "version": 1,
+            "language": "en",
+            "time_format": "12",
+            "open_delay_ms": 250,
+            "close_delay_ms": 400,
+            "hide_on_fullscreen": false
+        }"#;
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(storage.settings_path(), custom_json.as_bytes()).unwrap();
+
+        // Trigger live reload
+        unsafe {
+            with_state(raw_cell, |s| {
+                s.reload_settings(hwnd);
+                assert_eq!(s.language, Language::English);
+                assert_eq!(s.time_format, TimeFormat::Hour12);
+                assert_eq!(s.open_delay_ms, 250);
+                assert_eq!(s.close_delay_ms, 400);
+                assert!(!s.settings.hide_on_fullscreen);
+                assert!(s.watcher.is_none(), "Watcher must be stopped when disabled");
+            });
+        }
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+        println!("[D1 SETTINGS_RELOAD] Successfully reloaded and applied settings live");
+    }
+
+    #[test]
+    fn test_toggle_hide_on_fullscreen_repeatedly() {
+        let _dpi = set_dpi_awareness_v2();
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!("godnotch_test_toggle_{unique_id}"));
+        let storage = SettingsStorage::new_custom(test_dir.clone());
+
+        let notch = NotchWindow::create_with_storage(storage.clone())
+            .expect("Failed to create notch window for toggle test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Toggle 50 times between enabled and disabled
+        for i in 0..50 {
+            let enable = i % 2 == 0;
+            unsafe {
+                with_state(raw_cell, |s| {
+                    let mut new_settings = s.settings.clone();
+                    new_settings.hide_on_fullscreen = enable;
+                    s.apply_settings(hwnd, new_settings);
+                    if enable {
+                        assert!(s.watcher.is_some());
+                    } else {
+                        assert!(s.watcher.is_none());
+                    }
+                });
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+        println!(
+            "[D2 TOGGLE_LIFECYCLE] Successfully toggled hide_on_fullscreen 50 times without leaks"
+        );
+    }
+
+    #[test]
+    fn test_ensure_file_exists_on_open_request() {
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!("godnotch_test_ensure_{unique_id}"));
+        let storage = SettingsStorage::new_custom(test_dir.clone());
+
+        assert!(!storage.settings_path().exists());
+
+        let settings = Settings::default();
+        let path = storage
+            .ensure_file_exists(&settings)
+            .expect("Failed to ensure settings file exists");
+
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("\"version\": 1"));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+        println!("[D3 ENSURE_FILE] Successfully verified settings file creation when missing");
     }
 }

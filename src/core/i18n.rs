@@ -153,6 +153,33 @@ pub fn tray_autostart_label(lang: Language) -> &'static str {
     }
 }
 
+/// Returns the localized label for the "Hide on fullscreen" tray menu option.
+#[must_use]
+pub fn tray_hide_on_fullscreen_label(lang: Language) -> &'static str {
+    match lang {
+        Language::Indonesian => "Sembunyikan saat layar penuh",
+        Language::English => "Hide on fullscreen",
+    }
+}
+
+/// Returns the localized label for the "Open settings file" tray menu option.
+#[must_use]
+pub fn tray_open_settings_file_label(lang: Language) -> &'static str {
+    match lang {
+        Language::Indonesian => "Buka berkas pengaturan",
+        Language::English => "Open settings file",
+    }
+}
+
+/// Returns the localized label for the "Reload settings" tray menu option.
+#[must_use]
+pub fn tray_reload_settings_label(lang: Language) -> &'static str {
+    match lang {
+        Language::Indonesian => "Muat ulang pengaturan",
+        Language::English => "Reload settings",
+    }
+}
+
 /// Returns the localized label for the "Exit" tray menu option.
 #[must_use]
 #[allow(dead_code)] // Fase 1 T1.5
@@ -173,10 +200,35 @@ mod tests {
             tray_autostart_label(Language::Indonesian),
             "Mulai bersama Windows"
         );
+        assert_eq!(
+            tray_hide_on_fullscreen_label(Language::Indonesian),
+            "Sembunyikan saat layar penuh"
+        );
+        assert_eq!(
+            tray_open_settings_file_label(Language::Indonesian),
+            "Buka berkas pengaturan"
+        );
+        assert_eq!(
+            tray_reload_settings_label(Language::Indonesian),
+            "Muat ulang pengaturan"
+        );
         assert_eq!(tray_exit_label(Language::Indonesian), "Keluar");
+
         assert_eq!(
             tray_autostart_label(Language::English),
             "Start with Windows"
+        );
+        assert_eq!(
+            tray_hide_on_fullscreen_label(Language::English),
+            "Hide on fullscreen"
+        );
+        assert_eq!(
+            tray_open_settings_file_label(Language::English),
+            "Open settings file"
+        );
+        assert_eq!(
+            tray_reload_settings_label(Language::English),
+            "Reload settings"
         );
         assert_eq!(tray_exit_label(Language::English), "Exit");
     }

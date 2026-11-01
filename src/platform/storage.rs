@@ -125,6 +125,16 @@ impl SettingsStorage {
         self.base_dir.join("settings.json.corrupt")
     }
 
+    /// Ensures that `settings.json` exists on disk. If missing, saves the provided `settings`.
+    /// Returns the absolute path to `settings.json`.
+    pub fn ensure_file_exists(&self, settings: &Settings) -> Result<PathBuf, StorageError> {
+        let path = self.settings_path();
+        if !path.exists() {
+            self.save(settings)?;
+        }
+        Ok(path)
+    }
+
     /// Cleans up any stale temporary `.tmp` file left by an interrupted previous write.
     pub fn cleanup_temp(&self) {
         let tmp = self.temp_path();
