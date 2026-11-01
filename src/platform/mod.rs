@@ -18,4 +18,6 @@ pub mod tray;
 pub mod window;
 
 pub use single_instance::SingleInstance;
+#[allow(unused_imports)]
+pub use tray::{TrayIcon, TrayMenuCommand};
 pub use window::{NotchWindow, run_message_loop, set_dpi_awareness_v2};

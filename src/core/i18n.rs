@@ -143,9 +143,43 @@ pub fn format_time(format: TimeFormat, hour: u16, minute: u16) -> String {
     }
 }
 
+/// Returns the localized label for the "Start with Windows" tray menu option.
+#[must_use]
+#[allow(dead_code)] // Fase 1 T1.5
+pub fn tray_autostart_label(lang: Language) -> &'static str {
+    match lang {
+        Language::Indonesian => "Mulai bersama Windows",
+        Language::English => "Start with Windows",
+    }
+}
+
+/// Returns the localized label for the "Exit" tray menu option.
+#[must_use]
+#[allow(dead_code)] // Fase 1 T1.5
+pub fn tray_exit_label(lang: Language) -> &'static str {
+    match lang {
+        Language::Indonesian => "Keluar",
+        Language::English => "Exit",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_tray_menu_labels() {
+        assert_eq!(
+            tray_autostart_label(Language::Indonesian),
+            "Mulai bersama Windows"
+        );
+        assert_eq!(tray_exit_label(Language::Indonesian), "Keluar");
+        assert_eq!(
+            tray_autostart_label(Language::English),
+            "Start with Windows"
+        );
+        assert_eq!(tray_exit_label(Language::English), "Exit");
+    }
 
     #[test]
     fn test_language_from_locale_name() {
