@@ -17,6 +17,8 @@ pub mod single_instance;
 pub mod tray;
 pub mod window;
 
+#[allow(unused_imports)]
+pub use fullscreen::FullscreenWatcher;
 pub use single_instance::SingleInstance;
 #[allow(unused_imports)]
 pub use tray::{TrayIcon, TrayMenuCommand};
