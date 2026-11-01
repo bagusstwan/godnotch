@@ -18,6 +18,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::core::config::Settings;
+use crate::core::scheduler::Scheduler;
 
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
 const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
@@ -191,34 +192,141 @@ impl SettingsStorage {
     /// 2. Writes serialized JSON to `settings.json.tmp` and flushes buffers (`sync_all`).
     /// 3. Atomically replaces `settings.json` via `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
     pub fn save(&self, settings: &Settings) -> Result<(), StorageError> {
-        // Create folder only when first write occurs
-        if !self.base_dir.exists() {
-            std::fs::create_dir_all(&self.base_dir)?;
-        }
-
-        let tmp_path = self.temp_path();
-        let target_path = self.settings_path();
-
         let json = settings.to_json();
+        save_file_atomic(&self.base_dir, "settings.json", &json)
+    }
+}
 
-        // Write and sync temp file
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
+/// Atomically saves arbitrary string content to `{base_dir}/{filename}` using a temporary `.tmp`
+/// file and Win32 atomic replace.
+fn save_file_atomic(base_dir: &Path, filename: &str, content: &str) -> Result<(), StorageError> {
+    if !base_dir.exists() {
+        std::fs::create_dir_all(base_dir)?;
+    }
+
+    let tmp_path = base_dir.join(format!("{filename}.tmp"));
+    let target_path = base_dir.join(filename);
+
+    // Write and sync temp file
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+    }
+
+    // Atomically rename tmp to destination
+    if let Err(e) = atomic_rename(&tmp_path, &target_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    Ok(())
+}
+
+/// Manages atomic loading and saving of `Scheduler` to disk (`%APPDATA%\godnotch\schedule.json`).
+#[derive(Debug, Clone)]
+pub struct ScheduleStorage {
+    base_dir: PathBuf,
+}
+
+impl ScheduleStorage {
+    /// Creates a storage manager targeting the official `%APPDATA%\godnotch` directory.
+    #[must_use]
+    pub fn new_default() -> Option<Self> {
+        get_appdata_godnotch_dir().map(|base_dir| Self { base_dir })
+    }
+
+    /// Creates a storage manager targeting a custom directory (essential for unit testing).
+    #[must_use]
+    pub fn new_custom(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+
+    /// Returns a reference to the base directory.
+    #[must_use]
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    /// Path to `schedule.json`.
+    #[must_use]
+    pub fn schedule_path(&self) -> PathBuf {
+        self.base_dir.join("schedule.json")
+    }
+
+    /// Path to `schedule.json.tmp`.
+    #[must_use]
+    pub fn temp_path(&self) -> PathBuf {
+        self.base_dir.join("schedule.json.tmp")
+    }
+
+    /// Path to `schedule.json.corrupt`.
+    #[must_use]
+    pub fn corrupt_path(&self) -> PathBuf {
+        self.base_dir.join("schedule.json.corrupt")
+    }
+
+    /// Cleans up any stale temporary `.tmp` file left by an interrupted previous write.
+    pub fn cleanup_temp(&self) {
+        let tmp = self.temp_path();
+        if tmp.exists() {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+
+    /// Loads scheduler from disk.
+    ///
+    /// - If `schedule.json` is missing: returns `(Scheduler::new(now_utc_ms), LoadOutcome::DefaultNew)`
+    ///   without creating any directories or files.
+    /// - If `schedule.json` is corrupt: renames it to `schedule.json.corrupt` and returns
+    ///   `(Scheduler::new(now_utc_ms), LoadOutcome::CorruptRecoveredToDefault)`.
+    /// - If valid: returns `(scheduler, LoadOutcome::LoadedSuccessfully)`.
+    #[must_use]
+    pub fn load(&self, now_utc_ms: u64) -> (Scheduler, LoadOutcome) {
+        self.cleanup_temp();
+
+        let path = self.schedule_path();
+        if !path.exists() {
+            return (Scheduler::new(now_utc_ms), LoadOutcome::DefaultNew);
         }
 
-        // Atomically rename tmp to destination
-        if let Err(e) = atomic_rename(&tmp_path, &target_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_e) => {
+                #[cfg(debug_assertions)]
+                eprintln!("[godnotch] Failed to read schedule file: {_e}");
+                return (Scheduler::new(now_utc_ms), LoadOutcome::DefaultNew);
+            }
+        };
 
-        Ok(())
+        match Scheduler::from_bytes(&bytes, now_utc_ms) {
+            Ok(scheduler) => (scheduler, LoadOutcome::LoadedSuccessfully),
+            Err(_err) => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "[godnotch] Schedule file is corrupt: {_err}. Moving to schedule.json.corrupt"
+                );
+
+                let corrupt = self.corrupt_path();
+                let _ = atomic_rename(&path, &corrupt);
+
+                (
+                    Scheduler::new(now_utc_ms),
+                    LoadOutcome::CorruptRecoveredToDefault,
+                )
+            }
+        }
+    }
+
+    /// Atomically saves scheduler to disk.
+    /// Writes only when schedules change; first run does not create file unless saved.
+    pub fn save(&self, scheduler: &Scheduler) -> Result<(), StorageError> {
+        let json = scheduler.to_json();
+        save_file_atomic(&self.base_dir, "schedule.json", &json)
     }
 }
 
@@ -465,5 +573,122 @@ mod tests {
         let path = appdata.unwrap();
         println!("[APPDATA_TEST] Resolved path: {}", path.display());
         assert!(path.ends_with("godnotch"));
+    }
+
+    #[test]
+    fn test_schedule_storage_first_run_does_not_create_files_or_dir() {
+        let test_dir = TestDir::new("schedule_first_run");
+        let storage = ScheduleStorage::new_custom(test_dir.path.clone());
+
+        assert!(!storage.base_dir().exists());
+        assert!(!storage.schedule_path().exists());
+
+        let t0 = 1_700_000_000_000;
+        let (scheduler, outcome) = storage.load(t0);
+        assert_eq!(outcome, LoadOutcome::DefaultNew);
+        assert_eq!(scheduler.count(), 0);
+
+        assert!(
+            !storage.base_dir().exists(),
+            "First run load must not create base dir"
+        );
+        assert!(
+            !storage.schedule_path().exists(),
+            "First run load must not create schedule.json"
+        );
+    }
+
+    #[test]
+    fn test_schedule_storage_save_and_load_roundtrip() {
+        let test_dir = TestDir::new("schedule_roundtrip");
+        let storage = ScheduleStorage::new_custom(test_dir.path.clone());
+
+        let t0 = 1_700_000_000_000;
+        let mut scheduler = Scheduler::new(t0);
+        scheduler
+            .add(crate::core::scheduler::ScheduleEntry {
+                id: 42,
+                kind: 1,
+                recurrence: crate::core::scheduler::Recurrence::Once {
+                    at_utc_ms: t0 + 10_000,
+                },
+                misfire_policy: crate::core::scheduler::MisfirePolicy::FireOnce { grace_ms: 5000 },
+                payload: crate::core::scheduler::Payload::from_u32(0xCAFE),
+                next_due_utc_ms: t0 + 10_000,
+                last_fired_utc_ms: None,
+            })
+            .unwrap();
+
+        storage.save(&scheduler).expect("Save must succeed");
+        assert!(storage.schedule_path().exists());
+
+        let (loaded, outcome) = storage.load(t0);
+        assert_eq!(outcome, LoadOutcome::LoadedSuccessfully);
+        assert_eq!(loaded.count(), 1);
+        assert_eq!(loaded.entries(), scheduler.entries());
+    }
+
+    #[test]
+    fn test_schedule_storage_corrupt_file_moved_to_corrupt_and_returns_empty() {
+        let test_dir = TestDir::new("schedule_corrupt");
+        let storage = ScheduleStorage::new_custom(test_dir.path.clone());
+        std::fs::create_dir_all(&test_dir.path).unwrap();
+
+        let malformed_content = b"{\"version\": 1, \"entries\": [ { \"id\": ";
+        std::fs::write(storage.schedule_path(), malformed_content).unwrap();
+
+        let t0 = 1_700_000_000_000;
+        let (scheduler, outcome) = storage.load(t0);
+        assert_eq!(outcome, LoadOutcome::CorruptRecoveredToDefault);
+        assert_eq!(scheduler.count(), 0);
+
+        assert!(
+            !storage.schedule_path().exists(),
+            "Corrupt file must be moved"
+        );
+        assert!(
+            storage.corrupt_path().exists(),
+            "schedule.json.corrupt must exist"
+        );
+
+        let corrupt_content = std::fs::read(storage.corrupt_path()).unwrap();
+        assert_eq!(corrupt_content, malformed_content);
+    }
+
+    #[test]
+    fn test_schedule_storage_write_failure_preserves_old_file_and_does_not_panic() {
+        let test_dir = TestDir::new("schedule_write_failure");
+        let storage = ScheduleStorage::new_custom(test_dir.path.clone());
+
+        let t0 = 1_700_000_000_000;
+        let mut initial_scheduler = Scheduler::new(t0);
+        initial_scheduler
+            .add(crate::core::scheduler::ScheduleEntry {
+                id: 1,
+                kind: 1,
+                recurrence: crate::core::scheduler::Recurrence::Once {
+                    at_utc_ms: t0 + 5000,
+                },
+                misfire_policy: crate::core::scheduler::MisfirePolicy::Skip { grace_ms: 1000 },
+                payload: crate::core::scheduler::Payload::empty(),
+                next_due_utc_ms: t0 + 5000,
+                last_fired_utc_ms: None,
+            })
+            .unwrap();
+
+        storage.save(&initial_scheduler).unwrap();
+
+        // Create directory blocking tmp file
+        let tmp_path = storage.temp_path();
+        std::fs::create_dir(&tmp_path).unwrap();
+
+        let res = storage.save(&Scheduler::new(t0));
+        assert!(res.is_err());
+
+        let _ = std::fs::remove_dir(&tmp_path);
+
+        let (loaded, outcome) = storage.load(t0);
+        assert_eq!(outcome, LoadOutcome::LoadedSuccessfully);
+        assert_eq!(loaded.entries(), initial_scheduler.entries());
     }
 }
