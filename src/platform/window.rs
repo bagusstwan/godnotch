@@ -26,16 +26,20 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW, KillTimer,
-    LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_MOUSEMOVE, WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetSystemMetrics, GetWindowLongPtrW, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW, IDC_HAND,
+    KillTimer, LoadCursorW, MA_NOACTIVATE, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA,
+    UpdateLayeredWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CLOSE,
+    WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -336,6 +340,12 @@ pub struct NotchWindowState {
     pub settings: Settings,
     pub open_delay_ms: u32,
     pub close_delay_ms: u32,
+    pub ui: crate::core::ui::UiContext,
+    pub last_action: Option<crate::core::ui::UiAction>,
+    #[cfg(feature = "ui-demo")]
+    pub demo_click_count: u32,
+    #[cfg(feature = "ui-demo")]
+    pub demo_selected_row: Option<u32>,
     #[cfg(debug_assertions)]
     pub debug_timer_stats: DebugTimerStats,
     #[cfg(debug_assertions)]
@@ -497,6 +507,25 @@ impl NotchWindowState {
         }
     }
 
+    /// Dispatches a UI action triggered by user interaction with interactive widgets.
+    pub fn handle_ui_action(&mut self, action: crate::core::ui::UiAction) {
+        self.last_action = Some(action);
+        #[cfg(feature = "ui-demo")]
+        {
+            match action {
+                crate::core::ui::UiAction::Clicked(1) => {
+                    self.demo_click_count = self.demo_click_count.saturating_add(1);
+                    self.dirty = true;
+                }
+                crate::core::ui::UiAction::Clicked(id) if (100..=119).contains(&id) => {
+                    self.demo_selected_row = Some(id);
+                    self.dirty = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Renders the notch shape into the local DIB pixel buffer.
     /// This function performs purely CPU-bound rasterization and does NOT make
     /// Win32 presentation calls, ensuring it is safe to execute while borrowed.
@@ -540,54 +569,61 @@ impl NotchWindowState {
             );
         }
 
-        // 2. Open state content: large clock + date
+        // 2. Open state content: large clock + date (or interactive demo page if ui-demo feature enabled)
         if open_alpha > 0.001 {
-            let clock_str =
-                i18n::format_time(self.time_format, self.current_hour, self.current_minute);
-            let font_size_clock = (layout::OPEN_CLOCK_FONT_SIZE * self.scale).round() as u32;
-            let clock_w = self
-                .font_renderer
-                .measure_text_width(&clock_str, font_size_clock, true);
+            #[cfg(feature = "ui-demo")]
+            {
+                self.render_ui_demo(open_alpha);
+            }
+            #[cfg(not(feature = "ui-demo"))]
+            {
+                let clock_str =
+                    i18n::format_time(self.time_format, self.current_hour, self.current_minute);
+                let font_size_clock = (layout::OPEN_CLOCK_FONT_SIZE * self.scale).round() as u32;
+                let clock_w =
+                    self.font_renderer
+                        .measure_text_width(&clock_str, font_size_clock, true);
 
-            let clock_x = geom.x + (geom.width - clock_w) / 2.0;
-            let clock_y = geom.y + (48.0 * self.scale).round();
+                let clock_x = geom.x + (geom.width - clock_w) / 2.0;
+                let clock_y = geom.y + (48.0 * self.scale).round();
 
-            self.font_renderer.draw_text(
-                &mut self.pixmap.as_mut(),
-                &clock_str,
-                clock_x,
-                clock_y,
-                font_size_clock,
-                (255, 255, 255),
-                open_alpha,
-                true,
-            );
+                self.font_renderer.draw_text(
+                    &mut self.pixmap.as_mut(),
+                    &clock_str,
+                    clock_x,
+                    clock_y,
+                    font_size_clock,
+                    (255, 255, 255),
+                    open_alpha,
+                    true,
+                );
 
-            let date_str = i18n::format_date(
-                self.language,
-                self.current_day_of_week,
-                self.current_day,
-                self.current_month,
-                self.current_year,
-            );
-            let font_size_date = (layout::OPEN_DATE_FONT_SIZE * self.scale).round() as u32;
-            let date_w = self
-                .font_renderer
-                .measure_text_width(&date_str, font_size_date, false);
+                let date_str = i18n::format_date(
+                    self.language,
+                    self.current_day_of_week,
+                    self.current_day,
+                    self.current_month,
+                    self.current_year,
+                );
+                let font_size_date = (layout::OPEN_DATE_FONT_SIZE * self.scale).round() as u32;
+                let date_w =
+                    self.font_renderer
+                        .measure_text_width(&date_str, font_size_date, false);
 
-            let date_x = geom.x + (geom.width - date_w) / 2.0;
-            let date_y = geom.y + (74.0 * self.scale).round();
+                let date_x = geom.x + (geom.width - date_w) / 2.0;
+                let date_y = geom.y + (74.0 * self.scale).round();
 
-            self.font_renderer.draw_text(
-                &mut self.pixmap.as_mut(),
-                &date_str,
-                date_x,
-                date_y,
-                font_size_date,
-                (170, 170, 175), // #AAAAAF
-                open_alpha,
-                false,
-            );
+                self.font_renderer.draw_text(
+                    &mut self.pixmap.as_mut(),
+                    &date_str,
+                    date_x,
+                    date_y,
+                    font_size_date,
+                    (170, 170, 175), // #AAAAAF
+                    open_alpha,
+                    false,
+                );
+            }
         }
 
         let src = self.pixmap.data();
@@ -597,6 +633,272 @@ impl NotchWindowState {
 
         self.dirty = false;
         Ok(())
+    }
+
+    #[cfg(feature = "ui-demo")]
+    fn draw_rounded_rect(
+        pixmap: &mut tiny_skia::PixmapMut,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        color: (u8, u8, u8, u8),
+    ) {
+        use tiny_skia::{FillRule, Paint, PathBuilder, Transform};
+        let mut pb = PathBuilder::new();
+        let r = r.min(w / 2.0).min(h / 2.0);
+        pb.move_to(x + r, y);
+        pb.line_to(x + w - r, y);
+        pb.cubic_to(
+            x + w - r + r * crate::core::renderer::KAPPA,
+            y,
+            x + w,
+            y + r - r * crate::core::renderer::KAPPA,
+            x + w,
+            y + r,
+        );
+        pb.line_to(x + w, y + h - r);
+        pb.cubic_to(
+            x + w,
+            y + h - r + r * crate::core::renderer::KAPPA,
+            x + w - r + r * crate::core::renderer::KAPPA,
+            y + h,
+            x + w - r,
+            y + h,
+        );
+        pb.line_to(x + r, y + h);
+        pb.cubic_to(
+            x + r - r * crate::core::renderer::KAPPA,
+            y + h,
+            x,
+            y + h - r + r * crate::core::renderer::KAPPA,
+            x,
+            y + h - r,
+        );
+        pb.line_to(x, y + r);
+        pb.cubic_to(
+            x,
+            y + r - r * crate::core::renderer::KAPPA,
+            x + r - r * crate::core::renderer::KAPPA,
+            y,
+            x + r,
+            y,
+        );
+        pb.close();
+
+        if let Some(path) = pb.finish() {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(color.0, color.1, color.2, color.3);
+            paint.anti_alias = true;
+            pixmap.fill_path(
+                &path,
+                &paint,
+                FillRule::Winding,
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+
+    #[cfg(feature = "ui-demo")]
+    fn draw_rect(
+        pixmap: &mut tiny_skia::PixmapMut,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        color: (u8, u8, u8, u8),
+    ) {
+        if let Some(rect) = tiny_skia::Rect::from_xywh(x, y, w, h) {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color_rgba8(color.0, color.1, color.2, color.3);
+            pixmap.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+        }
+    }
+
+    /// Renders the interactive UI demo page (behind the `ui-demo` feature gate).
+    #[cfg(feature = "ui-demo")]
+    pub fn render_ui_demo(&mut self, open_alpha: f32) {
+        self.ui.clear_widgets();
+        let scale = self.scale;
+
+        // 1. Counter text
+        let counter_str = format!("Klik: {}", self.demo_click_count);
+        let font_size_counter = (12.0 * scale).round() as u32;
+        let counter_x = (36.0 * scale).round();
+        let counter_y = (24.0 * scale).round();
+        self.font_renderer.draw_text(
+            &mut self.pixmap.as_mut(),
+            &counter_str,
+            counter_x,
+            counter_y,
+            font_size_counter,
+            (220, 220, 225),
+            open_alpha,
+            true,
+        );
+
+        // 2. Active Button (ID 1)
+        let btn1_rect = crate::core::ui::Rect::new(36.0, 32.0, 105.0, 30.0);
+        self.ui.add_widget(crate::core::ui::Widget::new(
+            1,
+            btn1_rect,
+            crate::core::ui::WidgetKind::Button,
+            true,
+        ));
+        let btn1_state = self.ui.button_state(1);
+        let (btn1_bg, btn1_text_color) = match btn1_state {
+            crate::core::ui::ButtonVisualState::Normal => {
+                ((255, 255, 255, (35.0 * open_alpha) as u8), (240, 240, 240))
+            }
+            crate::core::ui::ButtonVisualState::Hover => {
+                ((255, 255, 255, (65.0 * open_alpha) as u8), (255, 255, 255))
+            }
+            crate::core::ui::ButtonVisualState::Pressed => {
+                ((255, 255, 255, (110.0 * open_alpha) as u8), (255, 255, 255))
+            }
+            crate::core::ui::ButtonVisualState::Disabled => {
+                ((255, 255, 255, (15.0 * open_alpha) as u8), (140, 140, 145))
+            }
+        };
+        Self::draw_rounded_rect(
+            &mut self.pixmap.as_mut(),
+            (btn1_rect.x * scale).round(),
+            (btn1_rect.y * scale).round(),
+            (btn1_rect.width * scale).round(),
+            (btn1_rect.height * scale).round(),
+            (6.0 * scale).round(),
+            btn1_bg,
+        );
+        let btn_font_size = (12.0 * scale).round() as u32;
+        let label1 = "Klik Saya";
+        let text1_w = self
+            .font_renderer
+            .measure_text_width(label1, btn_font_size, false);
+        let text1_x =
+            (btn1_rect.x * scale).round() + ((btn1_rect.width * scale).round() - text1_w) / 2.0;
+        let text1_y = (btn1_rect.y * scale).round() + (20.0 * scale).round();
+        self.font_renderer.draw_text(
+            &mut self.pixmap.as_mut(),
+            label1,
+            text1_x,
+            text1_y,
+            btn_font_size,
+            btn1_text_color,
+            open_alpha,
+            false,
+        );
+
+        // 3. Disabled Button (ID 2)
+        let btn2_rect = crate::core::ui::Rect::new(36.0, 70.0, 105.0, 30.0);
+        self.ui.add_widget(crate::core::ui::Widget::new(
+            2,
+            btn2_rect,
+            crate::core::ui::WidgetKind::Button,
+            false,
+        ));
+        Self::draw_rounded_rect(
+            &mut self.pixmap.as_mut(),
+            (btn2_rect.x * scale).round(),
+            (btn2_rect.y * scale).round(),
+            (btn2_rect.width * scale).round(),
+            (btn2_rect.height * scale).round(),
+            (6.0 * scale).round(),
+            (255, 255, 255, (15.0 * open_alpha) as u8),
+        );
+        let label2 = "Nonaktif";
+        let text2_w = self
+            .font_renderer
+            .measure_text_width(label2, btn_font_size, false);
+        let text2_x =
+            (btn2_rect.x * scale).round() + ((btn2_rect.width * scale).round() - text2_w) / 2.0;
+        let text2_y = (btn2_rect.y * scale).round() + (20.0 * scale).round();
+        self.font_renderer.draw_text(
+            &mut self.pixmap.as_mut(),
+            label2,
+            text2_x,
+            text2_y,
+            btn_font_size,
+            (140, 140, 145),
+            open_alpha * 0.6,
+            false,
+        );
+
+        // Divider
+        Self::draw_rect(
+            &mut self.pixmap.as_mut(),
+            (152.0 * scale).round(),
+            (15.0 * scale).round(),
+            (1.0 * scale).round().max(1.0),
+            (85.0 * scale).round(),
+            (255, 255, 255, (25.0 * open_alpha) as u8),
+        );
+
+        // 4. Scrollable List of 20 items (IDs 100..119)
+        let list_visible_height = 84.0;
+        let total_content_height = 20.0 * 20.0;
+        self.ui
+            .set_scroll_bounds(total_content_height, list_visible_height);
+        let scroll = self.ui.scroll_offset();
+
+        let row_h = 20.0;
+        for i in 0..20 {
+            let row_id = 100 + i as u32;
+            let row_y = 15.0 + (i as f32 * row_h) - scroll;
+            if row_y + row_h >= 15.0 && row_y <= 100.0 {
+                let row_rect = crate::core::ui::Rect::new(160.0, row_y, 195.0, 18.0);
+                self.ui.add_widget(crate::core::ui::Widget::new(
+                    row_id,
+                    row_rect,
+                    crate::core::ui::WidgetKind::ListRow,
+                    true,
+                ));
+
+                let is_selected = self.demo_selected_row == Some(row_id);
+                let is_hovered =
+                    self.ui.button_state(row_id) == crate::core::ui::ButtonVisualState::Hover;
+
+                let row_bg = if is_selected {
+                    Some((60, 130, 240, (180.0 * open_alpha) as u8))
+                } else if is_hovered {
+                    Some((255, 255, 255, (30.0 * open_alpha) as u8))
+                } else {
+                    None
+                };
+
+                if let Some(bg) = row_bg {
+                    Self::draw_rounded_rect(
+                        &mut self.pixmap.as_mut(),
+                        (row_rect.x * scale).round(),
+                        (row_rect.y * scale).round(),
+                        (row_rect.width * scale).round(),
+                        (row_rect.height * scale).round(),
+                        (4.0 * scale).round(),
+                        bg,
+                    );
+                }
+
+                let row_text = format!("Item {}", i + 1);
+                let row_font_size = (11.0 * scale).round() as u32;
+                let text_x = (row_rect.x * scale).round() + (8.0 * scale).round();
+                let text_y = (row_rect.y * scale).round() + (13.0 * scale).round();
+                self.font_renderer.draw_text(
+                    &mut self.pixmap.as_mut(),
+                    &row_text,
+                    text_x,
+                    text_y,
+                    row_font_size,
+                    if is_selected {
+                        (255, 255, 255)
+                    } else {
+                        (200, 200, 205)
+                    },
+                    open_alpha,
+                    false,
+                );
+            }
+        }
     }
 
     /// Kicks the animation pacing mechanism (DWM VSync thread with SetTimer fallback).
@@ -908,6 +1210,12 @@ impl NotchWindow {
             settings,
             open_delay_ms,
             close_delay_ms,
+            ui: crate::core::ui::UiContext::new(),
+            last_action: None,
+            #[cfg(feature = "ui-demo")]
+            demo_click_count: 0,
+            #[cfg(feature = "ui-demo")]
+            demo_selected_row: None,
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
             #[cfg(debug_assertions)]
@@ -997,6 +1305,29 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     }
 
     match msg {
+        WM_MOUSEACTIVATE => {
+            // Layered notch window should never steal focus or activate when clicked
+            LRESULT(MA_NOACTIVATE as isize)
+        }
+
+        WM_SETCURSOR => {
+            let hit_widget =
+                unsafe { with_state(raw_cell, |state| state.ui.hovered_widget().is_some()) }
+                    .unwrap_or(false);
+
+            if hit_widget {
+                // SAFETY: Setting hand cursor over interactive widgets.
+                // LoadCursorW(None, IDC_HAND) loads a predefined shared system cursor that does not need DestroyCursor.
+                unsafe {
+                    if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+                        let _ = SetCursor(cursor);
+                        return LRESULT(1);
+                    }
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+
         WM_MOUSEMOVE => {
             let is_hidden = unsafe {
                 with_state(raw_cell, |state| state.is_hidden_by_fullscreen).unwrap_or(false)
@@ -1005,9 +1336,13 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 return LRESULT(0);
             }
 
+            let px = (lp.0 & 0xFFFF) as i16 as i32;
+            let py = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+
             let mut start_tracking = false;
             let mut immediate_open = false;
             let mut open_delay = 80u32;
+            let mut present_data = None;
 
             // SAFETY: raw_cell points to a valid RefCell<NotchWindowState> associated with hwnd.
             unsafe {
@@ -1023,7 +1358,27 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                             immediate_open = true;
                         }
                     }
+
+                    let (lx, ly) =
+                        crate::core::ui::UiContext::physical_to_logical(px, py, state.scale);
+                    let can_interact = crate::core::ui::UiContext::can_interact(
+                        state.motion.height_progress(),
+                        state.animating,
+                    );
+                    let (dirty, _hover) = state.ui.on_mouse_move(lx, ly, can_interact);
+                    if dirty && !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        present_data =
+                            Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h));
+                    }
                 });
+            }
+
+            if let Some((mem_dc, screen_w, canvas_w, canvas_h)) = present_data {
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
             }
 
             if start_tracking {
@@ -1060,20 +1415,198 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_MOUSELEAVE => {
+            let mut present_data = None;
+            let mut arm_close_delay = false;
+            let mut close_delay = 300u32;
+
             // SAFETY: raw_cell is valid; resetting leave tracking state and retrieving close delay.
-            let close_delay = unsafe {
+            unsafe {
                 with_state(raw_cell, |state| {
                     state.is_tracking_leave = false;
-                    state.close_delay_ms
-                })
+                    close_delay = state.close_delay_ms;
+                    let dirty = state.ui.on_mouse_leave();
+                    if dirty && !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        present_data =
+                            Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h));
+                    }
+                    if state.ui.pressed_widget().is_none() {
+                        arm_close_delay = true;
+                    }
+                });
             }
-            .unwrap_or(300);
 
-            // Cancel pending open delay if cursor left before delay elapsed, and start close delay
+            if let Some((mem_dc, screen_w, canvas_w, canvas_h)) = present_data {
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+            }
+
+            // Cancel pending open delay if cursor left before delay elapsed, and start close delay if button not pressed
             // SAFETY: Canceling open delay timer and starting close delay timer.
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
-                SetTimer(hwnd, TIMER_CLOSE_DELAY, close_delay, None);
+                if arm_close_delay {
+                    SetTimer(hwnd, TIMER_CLOSE_DELAY, close_delay, None);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_LBUTTONDOWN => {
+            let is_hidden = unsafe {
+                with_state(raw_cell, |state| state.is_hidden_by_fullscreen).unwrap_or(false)
+            };
+            if is_hidden {
+                return LRESULT(0);
+            }
+
+            let px = (lp.0 & 0xFFFF) as i16 as i32;
+            let py = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            let mut capture_needed = false;
+            let mut present_data = None;
+
+            unsafe {
+                with_state(raw_cell, |state| {
+                    let (lx, ly) =
+                        crate::core::ui::UiContext::physical_to_logical(px, py, state.scale);
+                    let can_interact = crate::core::ui::UiContext::can_interact(
+                        state.motion.height_progress(),
+                        state.animating,
+                    );
+                    let (dirty, capture) = state.ui.on_mouse_down(lx, ly, can_interact);
+                    capture_needed = capture;
+                    if dirty && !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        present_data =
+                            Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h));
+                    }
+                });
+            }
+
+            if capture_needed {
+                // SAFETY: Capturing mouse input to track potential drag-out.
+                unsafe {
+                    let _ = SetCapture(hwnd);
+                }
+            }
+
+            if let Some((mem_dc, screen_w, canvas_w, canvas_h)) = present_data {
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+            }
+
+            LRESULT(0)
+        }
+
+        WM_LBUTTONUP => {
+            let is_hidden = unsafe {
+                with_state(raw_cell, |state| state.is_hidden_by_fullscreen).unwrap_or(false)
+            };
+            if is_hidden {
+                return LRESULT(0);
+            }
+
+            let px = (lp.0 & 0xFFFF) as i16 as i32;
+            let py = ((lp.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            let mut present_data = None;
+            let mut arm_close_delay = false;
+            let mut close_delay = 300u32;
+
+            unsafe {
+                with_state(raw_cell, |state| {
+                    let (lx, ly) =
+                        crate::core::ui::UiContext::physical_to_logical(px, py, state.scale);
+                    let can_interact = crate::core::ui::UiContext::can_interact(
+                        state.motion.height_progress(),
+                        state.animating,
+                    );
+                    let (dirty, action, _release) = state.ui.on_mouse_up(lx, ly, can_interact);
+                    if let Some(act) = action {
+                        state.handle_ui_action(act);
+                    }
+                    if dirty && !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        present_data =
+                            Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h));
+                    }
+
+                    if !state.is_tracking_leave {
+                        arm_close_delay = true;
+                        close_delay = state.close_delay_ms;
+                    }
+                });
+
+                // Release capture if held by our window
+                if GetCapture() == hwnd {
+                    let _ = ReleaseCapture();
+                }
+            }
+
+            if let Some((mem_dc, screen_w, canvas_w, canvas_h)) = present_data {
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+            }
+
+            if arm_close_delay {
+                unsafe {
+                    SetTimer(hwnd, TIMER_CLOSE_DELAY, close_delay, None);
+                }
+            }
+
+            LRESULT(0)
+        }
+
+        WM_CAPTURECHANGED => {
+            let present_data = unsafe {
+                with_state(raw_cell, |state| {
+                    let dirty = state.ui.on_capture_lost();
+                    if dirty && !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) = present_data {
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_MOUSEWHEEL => {
+            let z_delta = ((wp.0 >> 16) & 0xFFFF) as i16;
+            let delta_lines = (z_delta as f32 / 120.0) * 3.0;
+
+            let present_data = unsafe {
+                with_state(raw_cell, |state| {
+                    let dirty = state.ui.on_mouse_wheel(delta_lines);
+                    if dirty && !state.animating {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                        Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
+                    } else {
+                        None
+                    }
+                })
+            };
+
+            if let Some(Some((mem_dc, screen_w, canvas_w, canvas_h))) = present_data {
+                unsafe {
+                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                }
             }
             LRESULT(0)
         }
@@ -2544,5 +3077,277 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&test_dir);
         println!("[D3 ENSURE_FILE] Successfully verified settings file creation when missing");
+    }
+
+    #[test]
+    fn test_mouse_activate_returns_noactivate() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for activate test");
+        let hwnd = notch.hwnd();
+
+        // SAFETY: Calling window procedure directly to test WM_MOUSEACTIVATE response
+        let res = unsafe { notch_wndproc(hwnd, WM_MOUSEACTIVATE, WPARAM(0), LPARAM(0)) };
+        assert_eq!(
+            res,
+            LRESULT(MA_NOACTIVATE as isize),
+            "Notch window must return MA_NOACTIVATE to prevent stealing focus on click"
+        );
+        println!("[E1 NOACTIVATE] Verified WM_MOUSEACTIVATE returns MA_NOACTIVATE");
+    }
+
+    #[test]
+    fn test_synthetic_button_click_triggers_action() {
+        use crate::core::ui::UiAction;
+        #[cfg(not(feature = "ui-demo"))]
+        use crate::core::ui::{Rect, Widget, WidgetKind};
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for click test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        let (target_id, phys_x, phys_y) = unsafe {
+            with_state(raw_cell, |s| {
+                s.motion.reset(1.0);
+                s.animating = false;
+                s.last_action = None;
+                #[cfg(feature = "ui-demo")]
+                {
+                    s.dirty = true;
+                    let _ = s.render_buffer();
+                    let px = (50.0 * s.scale).round() as i32;
+                    let py = (45.0 * s.scale).round() as i32;
+                    (1, px, py)
+                }
+                #[cfg(not(feature = "ui-demo"))]
+                {
+                    s.ui.clear_widgets();
+                    s.ui.add_widget(Widget::new(
+                        101,
+                        Rect::new(0.0, 0.0, 200.0, 100.0),
+                        WidgetKind::Button,
+                        true,
+                    ));
+                    (101, 30, 30)
+                }
+            })
+            .unwrap()
+        };
+
+        // Mouse down at inside target
+        let lp_inside = LPARAM(((phys_y as u32) << 16 | (phys_x as u32 & 0xFFFF)) as isize);
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_inside);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(
+                    s.ui.pressed_widget(),
+                    Some(target_id),
+                    "Target widget should be in pressed state after mouse down"
+                );
+            });
+        }
+
+        // Mouse up at inside target
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_inside);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(
+                    s.last_action,
+                    Some(UiAction::Clicked(target_id)),
+                    "Releasing inside button must dispatch UiAction::Clicked"
+                );
+            });
+        }
+        println!("[E2 CLICK_ACTION] Verified synthetic button down + up triggers exactly 1 action");
+    }
+
+    #[test]
+    fn test_synthetic_drag_out_cancels_action() {
+        #[cfg(not(feature = "ui-demo"))]
+        use crate::core::ui::{Rect, Widget, WidgetKind};
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for drag test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Force motion to fully open state
+        let (phys_x, phys_y) = unsafe {
+            with_state(raw_cell, |s| {
+                s.motion.reset(1.0);
+                s.animating = false;
+                s.last_action = None;
+                #[cfg(feature = "ui-demo")]
+                {
+                    s.dirty = true;
+                    let _ = s.render_buffer();
+                    let px = (50.0 * s.scale).round() as i32;
+                    let py = (45.0 * s.scale).round() as i32;
+                    (px, py)
+                }
+                #[cfg(not(feature = "ui-demo"))]
+                {
+                    s.ui.clear_widgets();
+                    s.ui.add_widget(Widget::new(
+                        102,
+                        Rect::new(10.0, 10.0, 40.0, 20.0),
+                        WidgetKind::Button,
+                        true,
+                    ));
+                    (20, 20)
+                }
+            })
+            .unwrap()
+        };
+
+        // Mouse down inside button
+        let lp_inside = LPARAM(((phys_y as u32) << 16 | (phys_x as u32 & 0xFFFF)) as isize);
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_inside);
+        }
+
+        // Mouse up outside button at (350, 120)
+        let lp_outside = LPARAM(((120u32 << 16) | (350u32 & 0xFFFF)) as isize);
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_outside);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(
+                    s.last_action.is_none(),
+                    "Releasing outside button must cancel action and dispatch nothing"
+                );
+            });
+        }
+        println!("[E3 DRAG_CANCEL] Verified dragging out and releasing cancels click action");
+    }
+
+    #[test]
+    fn test_ui_idle_no_timers_running() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for idle test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(
+                    !s.animating,
+                    "Notch must not be animating when resting in idle state"
+                );
+                assert!(
+                    !s.pacer.is_thread_alive(),
+                    "DWM pacer thread must not be running during idle"
+                );
+            });
+        }
+        println!("[E4 IDLE_TIMERS] Verified zero animation timers/threads active during idle");
+    }
+
+    #[cfg(feature = "ui-demo")]
+    #[test]
+    fn test_ui_demo_interaction_flow() {
+        use crate::core::ui::UiAction;
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for demo test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Force open state and render demo buffer
+        let scale = unsafe {
+            with_state(raw_cell, |s| {
+                s.motion.reset(1.0);
+                s.animating = false;
+                s.dirty = true;
+                let _ = s.render_buffer();
+                assert!(
+                    s.ui.widget_count() >= 3,
+                    "Demo UI must register at least button 1, button 2, and list rows"
+                );
+                s.scale
+            })
+            .unwrap()
+        };
+
+        // 1. Click Button 1 (Active Button at logical 36, 32)
+        let phys_x = (50.0 * scale).round() as i32;
+        let phys_y = (45.0 * scale).round() as i32;
+        let lp_btn1 = LPARAM(((phys_y as u32) << 16 | (phys_x as u32 & 0xFFFF)) as isize);
+
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_btn1);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_btn1);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(
+                    s.last_action,
+                    Some(UiAction::Clicked(1)),
+                    "Clicking button 1 must dispatch UiAction::Clicked(1)"
+                );
+                assert_eq!(
+                    s.demo_click_count, 1,
+                    "Clicking button 1 must increment demo_click_count"
+                );
+            });
+        }
+
+        // 2. Click List Row 100 (at logical 180, 20)
+        let row_phys_x = (180.0 * scale).round() as i32;
+        let row_phys_y = (20.0 * scale).round() as i32;
+        let lp_row = LPARAM(((row_phys_y as u32) << 16 | (row_phys_x as u32 & 0xFFFF)) as isize);
+
+        unsafe {
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_row);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_row);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(
+                    s.demo_selected_row,
+                    Some(100),
+                    "Clicking row 100 must select row 100 in demo_selected_row"
+                );
+            });
+        }
+
+        // 3. Click Disabled Button 2 (at logical 36, 70)
+        let dis_phys_x = (50.0 * scale).round() as i32;
+        let dis_phys_y = (80.0 * scale).round() as i32;
+        let lp_btn2 = LPARAM(((dis_phys_y as u32) << 16 | (dis_phys_x as u32 & 0xFFFF)) as isize);
+
+        unsafe {
+            with_state(raw_cell, |s| s.last_action = None);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONDOWN, WPARAM(0), lp_btn2);
+            let _ = notch_wndproc(hwnd, WM_LBUTTONUP, WPARAM(0), lp_btn2);
+        }
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(
+                    s.last_action.is_none(),
+                    "Disabled button 2 must ignore clicks and dispatch no action"
+                );
+                assert_eq!(s.demo_click_count, 1, "Counter must remain unchanged");
+            });
+        }
+
+        println!(
+            "[F1 UI_DEMO] Successfully verified button clicks, counter increments, and row selection"
+        );
     }
 }

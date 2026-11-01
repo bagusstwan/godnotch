@@ -25,8 +25,10 @@ pub const OPEN_RADIUS_LOGICAL: f32 = 24.0;
 /// Font size for clock in closed state (logical pixels).
 pub const CLOSED_CLOCK_FONT_SIZE: f32 = 13.0;
 /// Font size for clock in open state (logical pixels).
+#[allow(dead_code)]
 pub const OPEN_CLOCK_FONT_SIZE: f32 = 40.0;
 /// Font size for date in open state (logical pixels).
+#[allow(dead_code)]
 pub const OPEN_DATE_FONT_SIZE: f32 = 13.0;
 
 /// Horizontal padding inside the open notch (logical pixels).
