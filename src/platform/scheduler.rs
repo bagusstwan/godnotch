@@ -120,6 +120,38 @@ impl TimeSource for PlatformTimeSource {
     }
 }
 
+/// Handles a fired demo schedule event: sounds `MessageBeep` and appends a line to
+/// `%TEMP%\godnotch-sched-demo.log` (capped at 256 KB).
+#[cfg(feature = "sched-demo")]
+pub fn handle_demo_event(ev: &crate::core::scheduler::SchedEvent) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBeep(utype: u32) -> windows::Win32::Foundation::BOOL;
+    }
+    // SAFETY: Emits default system notification sound without stealing focus.
+    unsafe {
+        let _ = MessageBeep(0xFFFF_FFFF);
+    }
+
+    let temp_log = std::env::temp_dir().join("godnotch-sched-demo.log");
+    const MAX_DEMO_LOG_BYTES: u64 = 256 * 1024;
+    let current_len = std::fs::metadata(&temp_log).map(|m| m.len()).unwrap_or(0);
+    if current_len < MAX_DEMO_LOG_BYTES {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&temp_log)
+        {
+            let line = format!(
+                "{},{},{},{},{},{}\n",
+                ev.fired_utc_ms, ev.due_utc_ms, ev.late_by_ms, ev.missed_count, ev.id, ev.kind
+            );
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

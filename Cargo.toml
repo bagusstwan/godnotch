@@ -13,6 +13,7 @@ ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 [features]
 default = []
 ui-demo = []
+sched-demo = []
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

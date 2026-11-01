@@ -49,6 +49,14 @@ pub const IDM_RELOAD_SETTINGS: usize = 1004;
 /// Menu item identifier for "Keluar" (Exit).
 pub const IDM_EXIT: usize = 1005;
 
+/// Menu item identifier for "Uji penjadwal (dev)" (Test scheduler).
+#[cfg(feature = "sched-demo")]
+pub const IDM_TEST_SCHEDULER: usize = 1006;
+
+/// Menu item identifier for "Hapus jadwal uji (dev)" (Remove test schedules).
+#[cfg(feature = "sched-demo")]
+pub const IDM_REMOVE_TEST_SCHEDULES: usize = 1007;
+
 /// Action triggered by the user from the tray context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayMenuCommand {
@@ -60,6 +68,12 @@ pub enum TrayMenuCommand {
     OpenSettingsFile,
     /// Reload settings.json from disk and apply changes live.
     ReloadSettings,
+    /// Schedule demo once, interval, and daily tasks for verification.
+    #[cfg(feature = "sched-demo")]
+    TestScheduler,
+    /// Remove all active demo schedule entries.
+    #[cfg(feature = "sched-demo")]
+    RemoveTestSchedules,
     /// Terminate the application cleanly.
     Exit,
 }
@@ -377,6 +391,17 @@ pub fn show_context_menu(
     let exit_label = i18n::tray_exit_label(lang);
     let mut exit_wide: Vec<u16> = exit_label.encode_utf16().chain(Some(0)).collect();
 
+    #[cfg(feature = "sched-demo")]
+    let test_sched_label = i18n::tray_test_scheduler_label(lang);
+    #[cfg(feature = "sched-demo")]
+    let mut test_sched_wide: Vec<u16> = test_sched_label.encode_utf16().chain(Some(0)).collect();
+
+    #[cfg(feature = "sched-demo")]
+    let remove_sched_label = i18n::tray_remove_test_schedules_label(lang);
+    #[cfg(feature = "sched-demo")]
+    let mut remove_sched_wide: Vec<u16> =
+        remove_sched_label.encode_utf16().chain(Some(0)).collect();
+
     let autostart_flags = MF_STRING
         | if is_autostart_checked {
             MF_CHECKED
@@ -423,6 +448,22 @@ pub fn show_context_menu(
             IDM_RELOAD_SETTINGS,
             PCWSTR::from_raw(reload_settings_wide.as_mut_ptr()),
         );
+        #[cfg(feature = "sched-demo")]
+        {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_TEST_SCHEDULER,
+                PCWSTR::from_raw(test_sched_wide.as_mut_ptr()),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_REMOVE_TEST_SCHEDULES,
+                PCWSTR::from_raw(remove_sched_wide.as_mut_ptr()),
+            );
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(
             menu,
@@ -461,6 +502,10 @@ pub fn show_context_menu(
         IDM_HIDE_ON_FULLSCREEN => Some(TrayMenuCommand::ToggleHideOnFullscreen),
         IDM_OPEN_SETTINGS_FILE => Some(TrayMenuCommand::OpenSettingsFile),
         IDM_RELOAD_SETTINGS => Some(TrayMenuCommand::ReloadSettings),
+        #[cfg(feature = "sched-demo")]
+        IDM_TEST_SCHEDULER => Some(TrayMenuCommand::TestScheduler),
+        #[cfg(feature = "sched-demo")]
+        IDM_REMOVE_TEST_SCHEDULES => Some(TrayMenuCommand::RemoveTestSchedules),
         IDM_EXIT => Some(TrayMenuCommand::Exit),
         _ => None,
     }
@@ -560,6 +605,24 @@ mod tests {
             },
             Some(TrayMenuCommand::Exit)
         );
+
+        #[cfg(feature = "sched-demo")]
+        {
+            assert_eq!(
+                match IDM_TEST_SCHEDULER {
+                    IDM_TEST_SCHEDULER => Some(TrayMenuCommand::TestScheduler),
+                    _ => None,
+                },
+                Some(TrayMenuCommand::TestScheduler)
+            );
+            assert_eq!(
+                match IDM_REMOVE_TEST_SCHEDULES {
+                    IDM_REMOVE_TEST_SCHEDULES => Some(TrayMenuCommand::RemoveTestSchedules),
+                    _ => None,
+                },
+                Some(TrayMenuCommand::RemoveTestSchedules)
+            );
+        }
 
         assert_eq!(
             match 9999 {

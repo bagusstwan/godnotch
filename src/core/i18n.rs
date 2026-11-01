@@ -190,6 +190,26 @@ pub fn tray_exit_label(lang: Language) -> &'static str {
     }
 }
 
+/// Returns the localized label for the "Test scheduler (dev)" tray menu option.
+#[cfg(feature = "sched-demo")]
+#[must_use]
+pub fn tray_test_scheduler_label(lang: Language) -> &'static str {
+    match lang {
+        Language::Indonesian => "Uji penjadwal (dev)",
+        Language::English => "Test scheduler (dev)",
+    }
+}
+
+/// Returns the localized label for the "Remove test schedules (dev)" tray menu option.
+#[cfg(feature = "sched-demo")]
+#[must_use]
+pub fn tray_remove_test_schedules_label(lang: Language) -> &'static str {
+    match lang {
+        Language::Indonesian => "Hapus jadwal uji (dev)",
+        Language::English => "Remove test schedules (dev)",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +251,27 @@ mod tests {
             "Reload settings"
         );
         assert_eq!(tray_exit_label(Language::English), "Exit");
+    }
+
+    #[cfg(feature = "sched-demo")]
+    #[test]
+    fn test_tray_demo_labels() {
+        assert_eq!(
+            tray_test_scheduler_label(Language::Indonesian),
+            "Uji penjadwal (dev)"
+        );
+        assert_eq!(
+            tray_test_scheduler_label(Language::English),
+            "Test scheduler (dev)"
+        );
+        assert_eq!(
+            tray_remove_test_schedules_label(Language::Indonesian),
+            "Hapus jadwal uji (dev)"
+        );
+        assert_eq!(
+            tray_remove_test_schedules_label(Language::English),
+            "Remove test schedules (dev)"
+        );
     }
 
     #[test]

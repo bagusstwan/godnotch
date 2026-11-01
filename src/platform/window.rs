@@ -604,6 +604,90 @@ impl NotchWindowState {
         removed
     }
 
+    /// Schedules 3 demo tasks for developer testing and verification (`sched-demo` feature):
+    /// 1. Once in 20s (FireOnce, grace 10m)
+    /// 2. Interval 60s (FireOnce)
+    /// 3. DailyAt now + 3m (FireOnce, grace 10m)
+    #[cfg(feature = "sched-demo")]
+    pub fn add_demo_schedules(&mut self, hwnd: HWND) {
+        use crate::core::scheduler::{
+            IntervalAnchor, MisfirePolicy, Payload, Recurrence, ScheduleEntry,
+            compute_next_daily_at,
+        };
+
+        let now_utc = PlatformTimeSource.now_utc_ms();
+
+        // 1. Once in 20 seconds (FireOnce, grace 10 minutes)
+        let _ = self.add_schedule(
+            ScheduleEntry {
+                id: 9001,
+                kind: 99,
+                recurrence: Recurrence::Once {
+                    at_utc_ms: now_utc + 20_000,
+                },
+                misfire_policy: MisfirePolicy::FireOnce {
+                    grace_ms: 10 * 60 * 1000,
+                },
+                payload: Payload::empty(),
+                next_due_utc_ms: now_utc + 20_000,
+                last_fired_utc_ms: None,
+            },
+            hwnd,
+        );
+
+        // 2. Interval 60 seconds (FireOnce)
+        let _ = self.add_schedule(
+            ScheduleEntry {
+                id: 9002,
+                kind: 99,
+                recurrence: Recurrence::Interval {
+                    every_ms: 60_000,
+                    anchor: IntervalAnchor::FromFire,
+                },
+                misfire_policy: MisfirePolicy::FireOnce {
+                    grace_ms: 10 * 60 * 1000,
+                },
+                payload: Payload::empty(),
+                next_due_utc_ms: now_utc + 60_000,
+                last_fired_utc_ms: None,
+            },
+            hwnd,
+        );
+
+        // 3. DailyAt now + 3 minutes (FireOnce, grace 10 minutes)
+        let local = PlatformTimeSource.utc_to_local(now_utc);
+        let total_mins = (local.hour * 60 + local.minute + 3) % (24 * 60);
+        let target_h = total_mins / 60;
+        let target_m = total_mins % 60;
+        let next_due = compute_next_daily_at(now_utc, target_h, target_m, &PlatformTimeSource);
+
+        let _ = self.add_schedule(
+            ScheduleEntry {
+                id: 9003,
+                kind: 99,
+                recurrence: Recurrence::DailyAt {
+                    hour: target_h,
+                    minute: target_m,
+                },
+                misfire_policy: MisfirePolicy::FireOnce {
+                    grace_ms: 10 * 60 * 1000,
+                },
+                payload: Payload::empty(),
+                next_due_utc_ms: next_due,
+                last_fired_utc_ms: None,
+            },
+            hwnd,
+        );
+    }
+
+    /// Removes the 3 demo schedules from the scheduler.
+    #[cfg(feature = "sched-demo")]
+    pub fn remove_demo_schedules(&mut self, hwnd: HWND) {
+        self.remove_schedule(9001, hwnd);
+        self.remove_schedule(9002, hwnd);
+        self.remove_schedule(9003, hwnd);
+    }
+
     /// Renders the notch shape into the local DIB pixel buffer.
     /// This function performs purely CPU-bound rasterization and does NOT make
     /// Win32 presentation calls, ensuring it is safe to execute while borrowed.
@@ -1908,7 +1992,18 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 }
                 let events =
                     unsafe { with_state(raw_cell, |state| state.poll_and_rearm_scheduler(hwnd)) };
-                let _ = events;
+                #[cfg(feature = "sched-demo")]
+                {
+                    if let Some(evs) = events {
+                        for ev in &evs {
+                            crate::platform::scheduler::handle_demo_event(ev);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "sched-demo"))]
+                {
+                    let _ = events;
+                }
             }
             LRESULT(0)
         }
@@ -2136,6 +2231,18 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                                     }
                                 }
                             }
+                            #[cfg(feature = "sched-demo")]
+                            crate::platform::tray::TrayMenuCommand::TestScheduler => unsafe {
+                                with_state(raw_cell, |state| {
+                                    state.add_demo_schedules(hwnd);
+                                });
+                            },
+                            #[cfg(feature = "sched-demo")]
+                            crate::platform::tray::TrayMenuCommand::RemoveTestSchedules => unsafe {
+                                with_state(raw_cell, |state| {
+                                    state.remove_demo_schedules(hwnd);
+                                });
+                            },
                             crate::platform::tray::TrayMenuCommand::Exit => {
                                 // SAFETY: Destroying window upon user exit request from tray menu.
                                 unsafe {
@@ -3592,5 +3699,59 @@ mod tests {
         println!(
             "[T2.2 SCHEDULER] Successfully verified platform scheduler integration, power and time handling"
         );
+    }
+
+    #[cfg(feature = "sched-demo")]
+    #[test]
+    fn test_sched_demo_feature_lifecycle() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for demo test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // 1. Add demo schedules
+        unsafe {
+            with_state(raw_cell, |state| {
+                state.add_demo_schedules(hwnd);
+                assert_eq!(state.scheduler.count(), 3);
+                assert!(state.scheduler.get(9001).is_some());
+                assert!(state.scheduler.get(9002).is_some());
+                assert!(state.scheduler.get(9003).is_some());
+            });
+        }
+
+        // 2. Remove demo schedules
+        unsafe {
+            with_state(raw_cell, |state| {
+                state.remove_demo_schedules(hwnd);
+                assert_eq!(state.scheduler.count(), 0);
+                assert!(state.scheduler.get(9001).is_none());
+                assert!(state.scheduler.get(9002).is_none());
+                assert!(state.scheduler.get(9003).is_none());
+            });
+        }
+
+        // 3. Test handle_demo_event creates log file
+        let dummy_ev = crate::core::scheduler::SchedEvent {
+            id: 9001,
+            kind: 99,
+            payload: crate::core::scheduler::Payload::empty(),
+            due_utc_ms: 1_700_000_000_000,
+            fired_utc_ms: 1_700_000_000_010,
+            late_by_ms: 10,
+            missed_count: 0,
+        };
+        crate::platform::scheduler::handle_demo_event(&dummy_ev);
+        let log_path = std::env::temp_dir().join("godnotch-sched-demo.log");
+        assert!(
+            log_path.exists(),
+            "%TEMP%\\godnotch-sched-demo.log must exist after demo event"
+        );
+        let content = std::fs::read_to_string(&log_path).expect("Log file readable");
+        assert!(content.contains("1700000000010,1700000000000,10,0,9001,99"));
+        let _ = std::fs::remove_file(&log_path);
+
+        println!("[T2.2 SCHED_DEMO] Successfully verified sched-demo lifecycle and logging");
     }
 }
