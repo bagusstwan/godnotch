@@ -28,12 +28,10 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetSystemMetrics,
-    GetWindowLongPtrW, HWND_MESSAGE, IDC_ARROW, KillTimer, LoadCursorW, MF_STRING, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SW_SHOWNOACTIVATE,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, ShowWindow, TPM_BOTTOMALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, HWND_MESSAGE, IDC_ARROW, KillTimer, LoadCursorW, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SW_SHOWNOACTIVATE, SetTimer,
+    SetWindowLongPtrW, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED,
     WM_MOUSEMOVE, WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
@@ -1060,32 +1058,8 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         WM_RBUTTONUP => {
-            // Right-click context menu (temporary exit path for Phase 1)
-            // Notice: Absolutely NO borrow on NotchWindowState is held while running
-            // the modal TrackPopupMenu message loop or calling DestroyWindow.
-            // SAFETY: Creating and displaying popup menu on right-click.
-            unsafe {
-                if let Ok(menu) = CreatePopupMenu() {
-                    let _ = AppendMenuW(menu, MF_STRING, 1, w!("Keluar"));
-                    let mut pt = POINT::default();
-                    let _ = GetCursorPos(&mut pt);
-                    let _ = SetForegroundWindow(hwnd);
-                    let cmd = TrackPopupMenu(
-                        menu,
-                        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_BOTTOMALIGN,
-                        pt.x,
-                        pt.y,
-                        0,
-                        hwnd,
-                        None,
-                    );
-                    let _ = DestroyMenu(menu);
-
-                    if cmd.0 == 1 {
-                        let _ = DestroyWindow(hwnd);
-                    }
-                }
-            }
+            // Right-click on the notch window intentionally does nothing.
+            // Application exit and management are routed exclusively through the system tray menu.
             LRESULT(0)
         }
 

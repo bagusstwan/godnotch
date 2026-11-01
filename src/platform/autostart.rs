@@ -9,9 +9,8 @@
 //! comparison) is decoupled from registry access to enable isolated testing.
 
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
-    RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows::core::PCWSTR;
 
@@ -394,13 +393,13 @@ mod tests {
         // 2. Set test value with quoted path
         let test_path = r"C:\Test Folder\godnotch.exe";
         let set_res = set_autostart_value(&test_val_name, test_path);
-        if let Err(ref e) = set_res {
-            if e.contains("Access is denied") {
-                println!(
-                    "[SKIP] Registry write restricted in current sandbox/permission environment: {e}"
-                );
-                return;
-            }
+        if let Err(ref e) = set_res
+            && e.contains("Access is denied")
+        {
+            println!(
+                "[SKIP] Registry write restricted in current sandbox/permission environment: {e}"
+            );
+            return;
         }
         assert!(
             set_res.is_ok(),
