@@ -793,7 +793,8 @@ impl NotchWindow {
                 let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
                 crate::core::fullscreen::Rect::new(0, 0, screen_w, screen_h)
             });
-        let watcher = Some(crate::platform::fullscreen::FullscreenWatcher::start(hwnd));
+        let mut watcher = crate::platform::fullscreen::FullscreenWatcher::start(hwnd);
+        let is_initially_fullscreen = watcher.check_fullscreen(notch_monitor_rect);
 
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
@@ -822,9 +823,9 @@ impl NotchWindow {
             pacer: DwmPacer::new(),
             tray,
             taskbar_created_msg,
-            is_hidden_by_fullscreen: false,
+            is_hidden_by_fullscreen: is_initially_fullscreen,
             notch_monitor_rect,
-            watcher,
+            watcher: Some(watcher),
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
             #[cfg(debug_assertions)]
@@ -862,16 +863,18 @@ impl NotchWindow {
         #[cfg(debug_assertions)]
         startup_profile.print();
 
-        // SAFETY: Displaying window without activating or stealing focus.
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        }
+        if !is_initially_fullscreen {
+            // SAFETY: Displaying window without activating or stealing focus.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
 
-        let delay_ms =
-            layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
-        // SAFETY: Setting initial one-shot timer to the next minute boundary.
-        unsafe {
-            SetTimer(hwnd, TIMER_MINUTE_CLOCK, delay_ms, None);
+            let delay_ms =
+                layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
+            // SAFETY: Setting initial one-shot timer to the next minute boundary.
+            unsafe {
+                SetTimer(hwnd, TIMER_MINUTE_CLOCK, delay_ms, None);
+            }
         }
 
         Ok(Self {
@@ -1072,6 +1075,13 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 unsafe {
                     let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
                 }
+                let is_hidden = unsafe {
+                    with_state(raw_cell, |state| state.is_hidden_by_fullscreen).unwrap_or(false)
+                };
+                if is_hidden {
+                    return LRESULT(0);
+                }
+
                 // SAFETY: Querying updated local system time.
                 let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
                 let next_delay = layout::calculate_next_minute_delay_ms(
@@ -1087,7 +1097,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let render_res = unsafe {
                     with_state(raw_cell, |state| {
                         let changed = state.update_time(&st);
-                        if changed && !state.animating {
+                        if changed && !state.animating && !state.is_hidden_by_fullscreen {
                             state.dirty = true;
                             let _ = state.render_buffer();
                             Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
@@ -1150,6 +1160,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 unsafe {
                     let _ = KillTimer(hwnd, crate::platform::fullscreen::TIMER_FULLSCREEN_DEBOUNCE);
                 }
+                crate::platform::fullscreen::clear_evaluation_pending();
 
                 let action = unsafe {
                     with_state(raw_cell, |state| {
@@ -1195,7 +1206,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             let new_scale = new_dpi as f32 / 96.0;
 
             // SAFETY: raw_cell is valid; updating scale and recalculating buffer.
-            let dpi_res = unsafe {
+            let (is_hidden, dpi_res) = unsafe {
                 with_state(raw_cell, |state| {
                     state.scale = new_scale;
                     let canvas = layout::canvas_size(new_scale);
@@ -1203,14 +1214,22 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     state.canvas_h = canvas.height as i32;
                     state.dirty = true;
                     let _ = state.render_buffer();
-                    (state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h)
+                    (
+                        state.is_hidden_by_fullscreen,
+                        (state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h),
+                    )
                 })
-            };
+            }
+            .unwrap_or((
+                false,
+                (windows::Win32::Graphics::Gdi::HDC::default(), 0, 0, 0),
+            ));
 
-            if let Some((mem_dc, screen_w, canvas_w, canvas_h)) = dpi_res {
+            if !is_hidden && dpi_res.1 > 0 {
                 // SAFETY: Presenting window at new scale without holding state borrow.
                 unsafe {
-                    let _ = present_layered_window(hwnd, mem_dc, screen_w, canvas_w, canvas_h);
+                    let _ =
+                        present_layered_window(hwnd, dpi_res.0, dpi_res.1, dpi_res.2, dpi_res.3);
                 }
             }
             LRESULT(0)
@@ -1222,6 +1241,13 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             unsafe {
                 let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
             }
+            let is_hidden = unsafe {
+                with_state(raw_cell, |state| state.is_hidden_by_fullscreen).unwrap_or(false)
+            };
+            if is_hidden {
+                return LRESULT(0);
+            }
+
             // SAFETY: Querying current system time after time change event.
             let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
             let time_format = query_system_time_format();
@@ -1239,7 +1265,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     state.time_format = time_format;
                     state.language = language;
                     state.update_time(&st);
-                    if !state.animating {
+                    if !state.animating && !state.is_hidden_by_fullscreen {
                         state.dirty = true;
                         let _ = state.render_buffer();
                         Some((state.mem_dc, state.screen_w, state.canvas_w, state.canvas_h))
@@ -1291,9 +1317,14 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
 
         crate::platform::fullscreen::WM_APP_FULLSCREEN_CHECK => {
-            // Debounce rapid window transition events (120 ms one-shot timer)
-            // SAFETY: Arming debounce timer for fullscreen evaluation.
+            crate::platform::fullscreen::clear_evaluation_pending();
+            // Re-scope location hook immediately and debounce rapid window transition events (120 ms one-shot timer)
             unsafe {
+                with_state(raw_cell, |state| {
+                    if let Some(ref mut watcher) = state.watcher {
+                        watcher.update_foreground_hook();
+                    }
+                });
                 SetTimer(
                     hwnd,
                     crate::platform::fullscreen::TIMER_FULLSCREEN_DEBOUNCE,
