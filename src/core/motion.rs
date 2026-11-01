@@ -106,6 +106,17 @@ impl Motion {
         self.height_spring.set_target(0.0);
     }
 
+    /// Immediately resets both springs to a fixed position with zero velocity.
+    pub fn reset(&mut self, pos: f32) {
+        self.direction = if pos >= 0.5 {
+            MotionDirection::Opening
+        } else {
+            MotionDirection::Closing
+        };
+        self.width_spring.reset(pos);
+        self.height_spring.reset(pos);
+    }
+
     /// Sets a generic target (1.0 = Open, 0.0 = Close).
     #[allow(dead_code)] // Fase 1
     pub fn set_target(&mut self, target: f32) {

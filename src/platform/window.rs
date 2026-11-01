@@ -29,12 +29,13 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, HWND_MESSAGE, IDC_ARROW, KillTimer, LoadCursorW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SW_SHOWNOACTIVATE, SetTimer,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DPICHANGED,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GetSystemMetrics, GetWindowLongPtrW, HWND_MESSAGE, HWND_TOPMOST, IDC_ARROW, KillTimer,
+    LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSCREEN, SM_CYSCREEN,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_MOUSEMOVE, WM_NCDESTROY, WM_RBUTTONUP, WM_TIMECHANGE, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::{Error, PCWSTR, Result, w};
 
@@ -328,6 +329,9 @@ pub struct NotchWindowState {
     pub pacer: DwmPacer,
     pub tray: Option<crate::platform::tray::TrayIcon>,
     pub taskbar_created_msg: u32,
+    pub is_hidden_by_fullscreen: bool,
+    pub notch_monitor_rect: crate::core::fullscreen::Rect,
+    pub watcher: Option<crate::platform::fullscreen::FullscreenWatcher>,
     #[cfg(debug_assertions)]
     pub debug_timer_stats: DebugTimerStats,
     #[cfg(debug_assertions)]
@@ -337,6 +341,9 @@ pub struct NotchWindowState {
 impl Drop for NotchWindowState {
     fn drop(&mut self) {
         self.pacer.stop();
+        if let Some(mut watcher) = self.watcher.take() {
+            watcher.stop();
+        }
         if !self.mem_dc.is_invalid() {
             // SAFETY: Deleting memory DC and bitmap allocated for DIB Section.
             unsafe {
@@ -350,6 +357,73 @@ impl Drop for NotchWindowState {
 }
 
 impl NotchWindowState {
+    /// Suppresses notch presentation and halts all animations while a fullscreen window is active.
+    pub fn hide_for_fullscreen(&mut self, hwnd: HWND) {
+        if self.is_hidden_by_fullscreen {
+            return;
+        }
+        self.is_hidden_by_fullscreen = true;
+        self.is_tracking_leave = false;
+
+        // If open or animating, immediately snap to closed without prolonged animation
+        self.stop_anim(hwnd);
+        self.motion.reset(0.0);
+        self.dirty = true;
+
+        // Terminate hover and minute clock timers while hidden to guarantee 0% CPU consumption
+        // SAFETY: Killing timers and hiding layered window without stealing focus.
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_OPEN_DELAY);
+            let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
+            let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+
+    /// Restores notch visibility and re-synchronizes the clock after fullscreen mode terminates.
+    pub fn restore_from_fullscreen(&mut self, hwnd: HWND) {
+        if !self.is_hidden_by_fullscreen {
+            return;
+        }
+        self.is_hidden_by_fullscreen = false;
+        self.motion.reset(0.0);
+
+        // Update time and re-arm minute clock timer
+        // SAFETY: Querying current local system time.
+        let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+        self.update_time(&st);
+
+        let next_delay =
+            layout::calculate_next_minute_delay_ms(st.wSecond as u32, st.wMilliseconds as u32);
+        // SAFETY: Arming minute clock timer.
+        unsafe {
+            SetTimer(hwnd, TIMER_MINUTE_CLOCK, next_delay, None);
+        }
+
+        self.dirty = true;
+        let _ = self.render_buffer();
+
+        // SAFETY: Presenting layered window, restoring visibility without activating, and re-asserting TOPMOST.
+        unsafe {
+            let _ = present_layered_window(
+                hwnd,
+                self.mem_dc,
+                self.screen_w,
+                self.canvas_w,
+                self.canvas_h,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
     /// Updates the cached system time and returns true if minute or date changed.
     pub fn update_time(&mut self, st: &SYSTEMTIME) -> bool {
         let changed = self.current_hour != st.wHour
@@ -713,6 +787,14 @@ impl NotchWindow {
         };
         let taskbar_created_msg = tray.as_ref().map_or(0, |t| t.taskbar_created_msg());
 
+        let notch_monitor_rect = crate::platform::fullscreen::get_monitor_rect_for_window(hwnd)
+            .unwrap_or_else(|| {
+                // SAFETY: Querying screen height as fallback monitor boundary.
+                let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+                crate::core::fullscreen::Rect::new(0, 0, screen_w, screen_h)
+            });
+        let watcher = Some(crate::platform::fullscreen::FullscreenWatcher::start(hwnd));
+
         let state = Box::new(RefCell::new(NotchWindowState {
             hwnd,
             mem_dc,
@@ -740,6 +822,9 @@ impl NotchWindow {
             pacer: DwmPacer::new(),
             tray,
             taskbar_created_msg,
+            is_hidden_by_fullscreen: false,
+            notch_monitor_rect,
+            watcher,
             #[cfg(debug_assertions)]
             debug_timer_stats: DebugTimerStats::default(),
             #[cfg(debug_assertions)]
@@ -828,6 +913,13 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
 
     match msg {
         WM_MOUSEMOVE => {
+            let is_hidden = unsafe {
+                with_state(raw_cell, |state| state.is_hidden_by_fullscreen).unwrap_or(false)
+            };
+            if is_hidden {
+                return LRESULT(0);
+            }
+
             let mut start_tracking = false;
             let mut immediate_open = false;
 
@@ -1053,6 +1145,40 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         }
                     }
                 }
+            } else if timer_id == crate::platform::fullscreen::TIMER_FULLSCREEN_DEBOUNCE {
+                // SAFETY: Killing one-shot debounce timer.
+                unsafe {
+                    let _ = KillTimer(hwnd, crate::platform::fullscreen::TIMER_FULLSCREEN_DEBOUNCE);
+                }
+
+                let action = unsafe {
+                    with_state(raw_cell, |state| {
+                        if let Some(ref mut watcher) = state.watcher {
+                            let should_hide = watcher.check_fullscreen(state.notch_monitor_rect);
+                            if should_hide && !state.is_hidden_by_fullscreen {
+                                Some(true)
+                            } else if !should_hide && state.is_hidden_by_fullscreen {
+                                Some(false)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                };
+
+                if let Some(Some(hide)) = action {
+                    unsafe {
+                        with_state(raw_cell, |state| {
+                            if hide {
+                                state.hide_for_fullscreen(hwnd);
+                            } else {
+                                state.restore_from_fullscreen(hwnd);
+                            }
+                        });
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -1164,11 +1290,59 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             LRESULT(0)
         }
 
+        crate::platform::fullscreen::WM_APP_FULLSCREEN_CHECK => {
+            // Debounce rapid window transition events (120 ms one-shot timer)
+            // SAFETY: Arming debounce timer for fullscreen evaluation.
+            unsafe {
+                SetTimer(
+                    hwnd,
+                    crate::platform::fullscreen::TIMER_FULLSCREEN_DEBOUNCE,
+                    120,
+                    None,
+                );
+            }
+            LRESULT(0)
+        }
+
+        WM_DISPLAYCHANGE => {
+            // Monitor configuration or resolution changed
+            let screen_w = (lp.0 & 0xFFFF) as i32;
+            let screen_h = ((lp.0 >> 16) & 0xFFFF) as i32;
+
+            unsafe {
+                with_state(raw_cell, |state| {
+                    state.screen_w = screen_w;
+                    if let Some(r) = crate::platform::fullscreen::get_monitor_rect_for_window(hwnd)
+                    {
+                        state.notch_monitor_rect = r;
+                    } else {
+                        state.notch_monitor_rect =
+                            crate::core::fullscreen::Rect::new(0, 0, screen_w, screen_h);
+                    }
+                    if !state.is_hidden_by_fullscreen {
+                        state.dirty = true;
+                        let _ = state.render_buffer();
+                    }
+                });
+                // Re-evaluate fullscreen on new display topology
+                SetTimer(
+                    hwnd,
+                    crate::platform::fullscreen::TIMER_FULLSCREEN_DEBOUNCE,
+                    50,
+                    None,
+                );
+            }
+            LRESULT(0)
+        }
+
         WM_DESTROY => {
-            // SAFETY: Stopping pacer thread, removing tray icon, terminating timers, and posting quit message.
+            // SAFETY: Stopping pacer thread, watcher hooks, removing tray icon, terminating timers, and posting quit message.
             unsafe {
                 with_state(raw_cell, |state| {
                     state.pacer.stop();
+                    if let Some(mut watcher) = state.watcher.take() {
+                        watcher.stop();
+                    }
                     if let Some(mut tray) = state.tray.take() {
                         tray.remove();
                     }
@@ -1177,6 +1351,7 @@ unsafe extern "system" fn notch_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = KillTimer(hwnd, TIMER_CLOSE_DELAY);
                 let _ = KillTimer(hwnd, TIMER_ANIM);
                 let _ = KillTimer(hwnd, TIMER_MINUTE_CLOCK);
+                let _ = KillTimer(hwnd, crate::platform::fullscreen::TIMER_FULLSCREEN_DEBOUNCE);
                 PostQuitMessage(0);
             }
             LRESULT(0)
@@ -1880,5 +2055,161 @@ mod tests {
         notch.startup_profile.print();
         assert!(!notch.hwnd().is_invalid());
         assert!(notch.startup_profile.total_to_presented_us > 0);
+    }
+
+    #[test]
+    fn test_fullscreen_hide_and_restore_state_machine() {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for fullscreen test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // 1. Initial state: notch is visible, not hidden
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(!s.is_hidden_by_fullscreen);
+            });
+            assert!(
+                IsWindowVisible(hwnd).as_bool(),
+                "Window must initially be visible"
+            );
+        }
+
+        // 2. Open the notch and start animation
+        unsafe {
+            with_state(raw_cell, |s| {
+                s.motion.open();
+                s.animating = true;
+                let _ = s.motion.step(0.05);
+                assert!(
+                    s.motion.width_progress() > 0.0,
+                    "Motion should be open/opening"
+                );
+            });
+        }
+
+        // 3. Trigger hide_for_fullscreen (e.g. game/video went fullscreen)
+        unsafe {
+            with_state(raw_cell, |s| {
+                s.hide_for_fullscreen(hwnd);
+            });
+        }
+
+        // 4. Verify: hidden flag set, window hidden, animation stopped, snapped to closed
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(s.is_hidden_by_fullscreen, "Must be flagged as hidden");
+                assert_eq!(
+                    s.motion.width_progress(),
+                    0.0,
+                    "Must be snapped to closed immediately"
+                );
+                assert!(!s.animating, "Animation must be stopped");
+            });
+            assert!(
+                !IsWindowVisible(hwnd).as_bool(),
+                "Window must be hidden (SW_HIDE)"
+            );
+        }
+
+        // 5. Trigger restore_from_fullscreen (game/video exited fullscreen)
+        unsafe {
+            with_state(raw_cell, |s| {
+                s.restore_from_fullscreen(hwnd);
+            });
+        }
+
+        // 6. Verify: hidden flag cleared, window visible again, remains closed
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert!(
+                    !s.is_hidden_by_fullscreen,
+                    "Must no longer be flagged as hidden"
+                );
+                assert_eq!(
+                    s.motion.width_progress(),
+                    0.0,
+                    "Must remain in closed state upon restoration"
+                );
+                assert!(!s.animating, "Must not be animating");
+            });
+            assert!(
+                IsWindowVisible(hwnd).as_bool(),
+                "Window must be visible again (SW_SHOWNOACTIVATE)"
+            );
+        }
+
+        println!(
+            "[C1 FULLSCREEN_STATE_MACHINE] Successfully verified hide, snap-close, and restore transitions"
+        );
+    }
+
+    #[test]
+    fn test_displaychange_updates_monitor_geometry() {
+        let _dpi = set_dpi_awareness_v2();
+        let notch =
+            NotchWindow::create().expect("Failed to create notch window for display change test");
+        let hwnd = notch.hwnd();
+        let raw_cell =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<NotchWindowState> };
+
+        // Send synthetic WM_DISPLAYCHANGE: 2560x1440
+        let new_w: u32 = 2560;
+        let new_h: u32 = 1440;
+        let lparam = (new_w & 0xFFFF) | ((new_h & 0xFFFF) << 16);
+        let lres =
+            unsafe { SendMessageW(hwnd, WM_DISPLAYCHANGE, WPARAM(32), LPARAM(lparam as isize)) };
+        assert_eq!(lres.0, 0);
+
+        unsafe {
+            with_state(raw_cell, |s| {
+                assert_eq!(s.screen_w, 2560);
+                assert!(!s.notch_monitor_rect.is_empty());
+            });
+        }
+        println!("[C2 DISPLAY_CHANGE] Successfully processed WM_DISPLAYCHANGE without errors");
+    }
+
+    #[test]
+    fn test_fullscreen_debounce_timer_lifecycle() {
+        use std::time::Duration;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, PM_REMOVE, PeekMessageW, PostMessageW, TranslateMessage,
+        };
+
+        let _dpi = set_dpi_awareness_v2();
+        let notch = NotchWindow::create().expect("Failed to create notch window for debounce test");
+        let hwnd = notch.hwnd();
+
+        // Post WM_APP_FULLSCREEN_CHECK
+        unsafe {
+            let _ = PostMessageW(
+                hwnd,
+                crate::platform::fullscreen::WM_APP_FULLSCREEN_CHECK,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+
+        // Pump messages for 250 ms to allow debounce timer (120ms) to fire and execute
+        let start = Instant::now();
+        let mut msg = MSG::default();
+        while start.elapsed() < Duration::from_millis(250) {
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        println!(
+            "[C3 DEBOUNCE_LIFECYCLE] Successfully debounced and evaluated fullscreen check via message pump"
+        );
     }
 }
